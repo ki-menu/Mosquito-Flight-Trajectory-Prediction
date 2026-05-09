@@ -146,7 +146,7 @@ def train():
     print(f"Using device: {Config.device}")
 
     wandb.init(
-        project="mosquito-trajectory",
+        project="DACON-2605-Mosquito-Trajectory",
         name=Config.run_name,
         config={
             "model":       "GRU",
@@ -276,6 +276,7 @@ def train():
             wandb.summary["best_val_loss"] = best_val_loss
             wandb.summary["best_val_dist"] = best_val_dist_total
             wandb.summary["best_val_acc"]  = val_acc
+            wandb.summary["best_epoch"]    = epoch + 1
 
     wandb.finish()
     return best_val_dist_total
