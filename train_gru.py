@@ -8,9 +8,11 @@ from pathlib import Path
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 import wandb
+from concurrent.futures import ThreadPoolExecutor
 from augmentation import get_rotation_matrix
 import random
 import os
+import math
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -32,16 +34,23 @@ class Config:
     sample_sub_path = data_dir / 'sample_submission.csv'
     
     # 모델 하이퍼파라미터
-    input_size = 3    # x, y, z
+    input_size = 3    # x, y, z  (delta 모드에서도 feature dim은 동일)
     hidden_size = 64
-    num_layers = 2
+    num_layers = 4
     output_size = 3   # 예측할 x, y, z
-    
+
+    # 입력 설정 (argparse로 덮어씀)
+    use_delta    = False  # --input delta: 11 coords → 10 displacement vectors
+    use_rotation = True   # --no-rotate: 회전 정규화 비활성화
+
     # 학습 설정
     batch_size = 128
     epochs = 600
     lr = 0.0001
-    patience = 20
+    min_lr = 1e-6          # LR 하한선 설정
+    scheduler_factor = 0.5 # 감쇠 폭 완화 (0.1 -> 0.5)
+    patience = 50          
+    warmup_epochs = 10     # 초기 Warm-up 에폭 수
     seed = 42
     run_name = "GRU"  # wandb 실행 이름
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -50,52 +59,80 @@ class Config:
 # 2. Dataset Definition (데이터 로더 정의)
 # ==========================================
 class MosquitoDataset(Dataset):
-    def __init__(self, file_paths, labels_df=None, is_train=True, augment_fns=None):
-        self.file_paths = file_paths
+    _cache_dir = Path('./data/.cache')
+
+    def __init__(self, file_paths, labels_df=None, is_train=True, augment_fns=None,
+                 use_delta=False, use_rotation=True):
         self.is_train = is_train
         self.augment_fns = augment_fns if augment_fns is not None else []
-        
-        self.sequences = []
-        self.last_positions = []
-        self.file_ids = []
-        self.rot_mats = []
-        
-        # 파일별로 데이터를 읽어 메모리에 적재
-        for path in tqdm(file_paths, desc="Loading data"):
-            df = pd.read_csv(path)
-            # Shape: (11, 3) -> 11 timesteps (-400ms to 0ms)
-            seq = df[['x', 'y', 'z']].values.astype(np.float32)
-            
-            # 학습 시 데이터 증강 적용
-            if self.is_train:
+
+        # ── 1. raw sequences 로드 (캐시 우선 → 병렬 I/O) ─────────────────
+        self._cache_dir.mkdir(exist_ok=True)
+        cache_key = f"{len(file_paths)}_{file_paths[0].stem}_{file_paths[-1].stem}"
+        cache_file = self._cache_dir / f"{cache_key}.npz"
+
+        if cache_file.exists():
+            print(f"캐시 로드: {cache_file}")
+            data = np.load(cache_file, allow_pickle=True)
+            raw = data['sequences']                    # (N, T, 3)
+            self.file_ids = data['file_ids'].tolist()
+        else:
+            def _load(path):
+                return np.loadtxt(str(path), delimiter=',', skiprows=1,
+                                  usecols=(1, 2, 3), dtype=np.float32)
+
+            n_workers = min(32, (os.cpu_count() or 1) * 4)
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                seqs = list(tqdm(pool.map(_load, file_paths),
+                                 total=len(file_paths), desc="Loading data"))
+
+            self.file_ids = [p.stem for p in file_paths]
+            raw = np.stack(seqs)                       # (N, T, 3)
+            np.savez(cache_file, sequences=raw, file_ids=np.array(self.file_ids))
+            print(f"캐시 저장: {cache_file}")
+
+        # ── 2. augmentation (학습 시에만, raw에 적용) ─────────────────────
+        if is_train and self.augment_fns:
+            aug = []
+            for seq in raw:
                 for fn in self.augment_fns:
                     seq = fn(seq)
-            
-            # 회전 정규화 (선택적: get_rotation_matrix 사용 시)
-            # 여기서는 모든 궤적을 x축 방향으로 정렬하는 canonical frame으로 변환
-            rot_mat = get_rotation_matrix(seq)
-            self.rot_mats.append(rot_mat)
-            seq_rotated = seq @ rot_mat.T
-            
-            # 모델의 학습 효율을 높이기 위해 마지막 위치(0ms)를 기준으로 상대 위치(변위)로 변환
-            last_pos = seq_rotated[-1].copy()
-            seq_norm = seq_rotated - last_pos
-            
-            self.sequences.append(seq_norm)
-            self.last_positions.append(seq[-1].copy()) # 원본 좌표계에서의 마지막 위치
-            self.file_ids.append(path.stem)
-            
-        if self.is_train and labels_df is not None:
-            # 라벨도 변위(Displacement)로 변환하여 Target으로 설정
-            labels_dict = labels_df.set_index('id')[['x', 'y', 'z']].T.to_dict('list')
-            self.targets = []
-            for fid, last_pos_orig, rot_mat in zip(self.file_ids, self.last_positions, self.rot_mats):
-                target_pos_orig = np.array(labels_dict[fid], dtype=np.float32)
-                # 정답 데이터도 동일한 회전 및 변위 변환 적용
-                target_rotated = target_pos_orig @ rot_mat.T
-                last_pos_rotated = last_pos_orig @ rot_mat.T
-                target_norm = target_rotated - last_pos_rotated
-                self.targets.append(target_norm)
+                aug.append(seq)
+            raw = np.array(aug, dtype=np.float32)
+
+        # ── 3. 회전 정규화 + 원점 이동 (벡터 연산) ───────────────────────
+        N = len(raw)
+        if use_rotation:
+            rot_mats = np.array(
+                [get_rotation_matrix(seq) for seq in raw], dtype=np.float32
+            )                                          # (N, 3, 3)
+            raw_rotated = np.einsum('ntj,nij->nti', raw, rot_mats)
+        else:
+            rot_mats    = np.tile(np.eye(3, dtype=np.float32), (N, 1, 1))  # identity
+            raw_rotated = raw
+
+        rot_last       = raw_rotated[:, -1, :]                    # (N, 3)
+        sequences_norm = (raw_rotated - rot_last[:, np.newaxis, :]).astype(np.float32)
+
+        # ── 4. delta 변환: (N, T, 3) → (N, T-1, 3) ───────────────────────
+        if use_delta:
+            sequences_norm = np.diff(sequences_norm, axis=1).astype(np.float32)
+
+        self.sequences      = list(sequences_norm)
+        self.last_positions = list(raw[:, -1, :].astype(np.float32))  # 원본 좌표계
+        self.rot_mats       = list(rot_mats)
+
+        # ── 5. 라벨 처리 (벡터 연산) ─────────────────────────────────────
+        if is_train and labels_df is not None:
+            labels_dict  = labels_df.set_index('id')[['x', 'y', 'z']].T.to_dict('list')
+            target_array = np.array(
+                [labels_dict[fid] for fid in self.file_ids], dtype=np.float32
+            )                                          # (N, 3)
+            displacement = target_array - raw[:, -1, :]              # (N, 3)
+            # (target - last) @ R.T  →  einsum 'nj,nij->ni'
+            self.targets = list(
+                np.einsum('nj,nij->ni', displacement, rot_mats).astype(np.float32)
+            )
 
     def __len__(self):
         return len(self.sequences)
@@ -138,6 +175,22 @@ class MosquitoGRU(nn.Module):
         out = self.fc(out)
         return out
 
+class WingLoss(nn.Module):
+    def __init__(self, w=0.05, epsilon=0.01):
+        super(WingLoss, self).__init__()
+        self.w = w
+        self.epsilon = epsilon
+        self.c = w - w * math.log(1.0 + w / epsilon)
+
+    def forward(self, y_pred, y_true):
+        x = torch.abs(y_pred - y_true)
+        loss = torch.where(
+            x < self.w,
+            self.w * torch.log(1.0 + x / self.epsilon),
+            x - self.c
+        )
+        return loss.mean()
+
 # ==========================================
 # 4. Training Loop (학습 루프)
 # ==========================================
@@ -149,15 +202,18 @@ def train():
         project="DACON-2605-Mosquito-Trajectory",
         name=Config.run_name,
         config={
-            "model":       "GRU",
-            "input_size":  Config.input_size,
-            "hidden_size": Config.hidden_size,
-            "num_layers":  Config.num_layers,
-            "output_size": Config.output_size,
-            "batch_size":  Config.batch_size,
-            "epochs":      Config.epochs,
-            "lr":          Config.lr,
-            "device":      str(Config.device),
+            "model":        "GRU",
+            "input_size":   Config.input_size,
+            "hidden_size":  Config.hidden_size,
+            "num_layers":   Config.num_layers,
+            "output_size":  Config.output_size,
+            "batch_size":   Config.batch_size,
+            "epochs":       Config.epochs,
+            "lr":           Config.lr,
+            "device":       str(Config.device),
+            "use_delta":    Config.use_delta,
+            "use_rotation": Config.use_rotation,
+            "patience":     Config.patience,
         },
     )
 
@@ -174,8 +230,13 @@ def train():
     ]
 
     # 데이터 로더 생성 (검증셋은 augmentation 없이)
-    train_dataset = MosquitoDataset(train_files, train_labels, is_train=True, augment_fns=augment_fns)
-    val_dataset = MosquitoDataset(val_files, train_labels, is_train=True)
+    train_dataset = MosquitoDataset(train_files, train_labels, is_train=True,
+                                    augment_fns=augment_fns,
+                                    use_delta=Config.use_delta,
+                                    use_rotation=Config.use_rotation)
+    val_dataset   = MosquitoDataset(val_files, train_labels, is_train=True,
+                                    use_delta=Config.use_delta,
+                                    use_rotation=Config.use_rotation)
     
     train_loader = DataLoader(train_dataset, batch_size=Config.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=Config.batch_size, shuffle=False)
@@ -188,15 +249,31 @@ def train():
         output_size=Config.output_size
     ).to(Config.device)
     
-    criterion = nn.MSELoss()
+    # 모델 가중치 및 기울기 로그 기록 설정
+    wandb.watch(model, log='all', log_freq=100)
+    
+    criterion = WingLoss(w=0.03, epsilon=0.005)
     optimizer = torch.optim.Adam(model.parameters(), lr=Config.lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=Config.patience)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='min', 
+        factor=Config.scheduler_factor, 
+        patience=Config.patience,
+        min_lr=Config.min_lr
+    )
     
     ACC_THRESHOLD = 0.01  # 정답 인정 거리 기준 (m)
     best_val_loss = float('inf')
     best_val_dist_total = float('inf')
+    best_epoch = 0
 
     for epoch in range(Config.epochs):
+        # ── 1. Warm-up 전략 적용 ──────────────────────────────────────
+        if epoch < Config.warmup_epochs:
+            curr_lr = Config.lr * (epoch + 1) / Config.warmup_epochs
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = curr_lr
+        
         model.train()
         train_loss = 0.0
         train_dist = 0.0
@@ -257,34 +334,40 @@ def train():
             "learning_rate": optimizer.param_groups[0]['lr'],
         })
 
-        # 스케줄러 업데이트
-        scheduler.step(val_loss)
+        # 스케줄러 업데이트 (Warm-up 이후에만 작동하도록 설정 가능)
+        if epoch >= Config.warmup_epochs:
+            scheduler.step(val_loss)
 
-        # 성능이 개선되면 모델 저장
+        # 성능이 개선되면 모델 저장 (임시 저장)
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_val_dist_total = val_dist
+            best_epoch = epoch + 1
             
-            # 폴더 생성 및 모델 저장
             Path('model').mkdir(exist_ok=True)
-            model_path = f'model/gru_{best_val_dist_total:.4f}.pth'
-            torch.save(model.state_dict(), model_path)
-            # 추론을 위해 가장 최근의 베스트 모델도 저장
-            torch.save(model.state_dict(), 'best_gru_model.pth')
+            # 중간에 꺼질 수 있으므로 임시 파일로 계속 갱신
+            torch.save(model.state_dict(), 'model/best_model_tmp.pth')
             
-            print(f"  --> Saved best model to {model_path}")
+            print(f"  --> Updated best model (Epoch {best_epoch}, Loss: {best_val_loss:.6f})")
             wandb.summary["best_val_loss"] = best_val_loss
             wandb.summary["best_val_dist"] = best_val_dist_total
             wandb.summary["best_val_acc"]  = val_acc
-            wandb.summary["best_epoch"]    = epoch + 1
+            wandb.summary["best_epoch"]    = best_epoch
+            wandb.summary["patience"]      = Config.patience
+
+    # 학습 종료 후 최종 파일명으로 변경 (Dist값과 에폭 포함)
+    if best_epoch > 0:
+        final_model_path = f'model/gru_{best_val_dist_total:.4f}_{best_epoch}.pth'
+        os.rename('model/best_model_tmp.pth', final_model_path)
+        print(f"\nTraining complete. Final best model saved to: {final_model_path}")
 
     wandb.finish()
-    return best_val_dist_total
+    return best_val_dist_total, best_epoch
 
 # ==========================================
 # 5. Inference / Prediction (추론 루프)
 # ==========================================
-def inference(best_val_dist=None):
+def inference(best_val_dist=None, best_epoch=None):
     # 저장된 베스트 모델 불러오기
     model = MosquitoGRU(
         input_size=Config.input_size, 
@@ -293,17 +376,34 @@ def inference(best_val_dist=None):
         output_size=Config.output_size
     ).to(Config.device)
     
-    if best_val_dist is not None:
-        model_path = f'model/gru_{best_val_dist:.4f}.pth'
+    if best_epoch is not None and best_val_dist is not None:
+        # train()에서 반환받은 Dist와 Epoch으로 정확한 매칭
+        model_path = f'model/gru_{best_val_dist:.4f}_{best_epoch}.pth'
     else:
-        model_path = 'best_gru_model.pth'
+        # 특정 파일이 지정되지 않은 경우 model 폴더에서 가장 성능이 좋은(Dist가 낮은) 파일 검색
+        save_files = list(Path('model').glob('gru_*_*.pth'))
+        if not save_files:
+            raise FileNotFoundError("학습된 모델 파일을 찾을 수 없습니다. (model/gru_*.pth)")
         
+        # 파일명 형식: gru_{dist}_{epoch}.pth -> dist(두 번째 요소)가 가장 작은 것 선택
+        def get_dist(path):
+            try:
+                # 0.0123 같은 실수값 추출
+                return float(path.stem.split('_')[1])
+            except:
+                return float('inf')
+        
+        model_path = sorted(save_files, key=get_dist)[0]
+        
+    print(f"Loading model from: {model_path}")
     model.load_state_dict(torch.load(model_path))
     model.eval()
     
     # Test 데이터셋 로드
     test_files = sorted(list(Config.test_dir.glob('TEST_*.csv')))
-    test_dataset = MosquitoDataset(test_files, is_train=False)
+    test_dataset = MosquitoDataset(test_files, is_train=False,
+                                   use_delta=Config.use_delta,
+                                   use_rotation=Config.use_rotation)
     test_loader = DataLoader(test_dataset, batch_size=Config.batch_size, shuffle=False)
     
     predictions = []
@@ -349,17 +449,26 @@ def inference(best_val_dist=None):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description="Mosquito Flight Trajectory GRU Training/Inference")
-    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'gpu'], 
-                        help="Device to run on: 'auto' (default), 'cpu', or 'gpu'")
+    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'gpu'],
+                        help="Device: 'auto' (default), 'cpu', 'gpu'")
     parser.add_argument('--mode', type=str, default='all', choices=['train', 'infer', 'all'],
-                        help="Mode to run: 'train', 'infer', or 'all' (default)")
+                        help="Mode: 'train', 'infer', 'all' (default)")
     parser.add_argument('--name', type=str, default=None,
                         help="Wandb run name (default: from Config)")
+    parser.add_argument('--input', type=str, default='raw', choices=['raw', 'delta'],
+                        help="Input type: 'raw' (11×3 coords, default) or "
+                             "'delta' (10×3 displacement vectors)")
+    parser.add_argument('--no-rotate', dest='rotate', action='store_false',
+                        help="Disable rotation normalization (last-step → +x axis). "
+                             "Default: rotation ON")
+    parser.set_defaults(rotate=True)
     args = parser.parse_args()
 
     # 설정 업데이트
     if args.name:
         Config.run_name = args.name
+    Config.use_delta    = (args.input == 'delta')
+    Config.use_rotation = args.rotate
 
     # 디바이스 설정
     if args.device == 'cpu':
@@ -368,16 +477,27 @@ if __name__ == '__main__':
         if torch.cuda.is_available():
             Config.device = torch.device('cuda')
         else:
-            print("Warning: GPU requested but not available. Falling back to CPU.")
+            print("Warning: CUDA GPU not available. Falling back to CPU.")
             Config.device = torch.device('cpu')
-    else:
-        Config.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    elif args.device == 'mps':
+        if torch.backends.mps.is_available():
+            Config.device = torch.device('mps')
+        else:
+            print("Warning: MPS not available. Falling back to CPU.")
+            Config.device = torch.device('cpu')
+    else:  # auto
+        if torch.cuda.is_available():
+            Config.device = torch.device('cuda')
+        elif torch.backends.mps.is_available():
+            Config.device = torch.device('mps')
+        else:
+            Config.device = torch.device('cpu')
 
-    best_dist = None
+    best_dist, best_epoch = None, None
     if args.mode in ['train', 'all']:
         print("--- Starting GRU Training ---")
-        best_dist = train()
+        best_dist, best_epoch = train()
         
     if args.mode in ['infer', 'all']:
         print("\n--- Starting Inference ---")
-        inference(best_dist)
+        inference(best_dist, best_epoch)

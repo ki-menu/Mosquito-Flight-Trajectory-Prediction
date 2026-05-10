@@ -9,3 +9,6 @@ wandb/
 
 #mac
 .DS_Store
+
+#vs
+.vscode/
