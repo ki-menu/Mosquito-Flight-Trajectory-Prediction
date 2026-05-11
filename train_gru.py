@@ -38,6 +38,7 @@ class Config:
     hidden_size = 64
     num_layers = 4
     output_size = 3   # 예측할 x, y, z
+    dropout_rate = 0.2
 
     # 입력 설정 (argparse로 덮어씀)
     use_delta    = False  # --input delta: 11 coords → 10 displacement vectors
@@ -62,9 +63,10 @@ class MosquitoDataset(Dataset):
     _cache_dir = Path('./data/.cache')
 
     def __init__(self, file_paths, labels_df=None, is_train=True, augment_fns=None,
-                 use_delta=False, use_rotation=True):
+                 use_delta=False, use_rotation=True, subseq_aug=False):
         self.is_train = is_train
         self.augment_fns = augment_fns if augment_fns is not None else []
+        self.subseq_aug = subseq_aug
 
         # ── 1. raw sequences 로드 (캐시 우선 → 병렬 I/O) ─────────────────
         self._cache_dir.mkdir(exist_ok=True)
@@ -91,6 +93,15 @@ class MosquitoDataset(Dataset):
             np.savez(cache_file, sequences=raw, file_ids=np.array(self.file_ids))
             print(f"캐시 저장: {cache_file}")
 
+        # ── 1.5. 라벨 배열 준비 (is_train 인 경우) ────────────────────────
+        if is_train and labels_df is not None:
+            labels_dict  = labels_df.set_index('id')[['x', 'y', 'z']].T.to_dict('list')
+            original_targets = np.array(
+                [labels_dict[fid] for fid in self.file_ids], dtype=np.float32
+            )
+        else:
+            original_targets = None
+
         # ── 2. augmentation (학습 시에만, raw에 적용) ─────────────────────
         if is_train and self.augment_fns:
             aug = []
@@ -99,6 +110,59 @@ class MosquitoDataset(Dataset):
                     seq = fn(seq)
                 aug.append(seq)
             raw = np.array(aug, dtype=np.float32)
+
+        # ── 2.5. Sub-sequence Augmentation (Forward & Reverse) ──────────
+        if is_train and original_targets is not None and self.subseq_aug:
+            aug_raw = []
+            aug_targets = []
+            
+            for seq_idx, seq in enumerate(raw):
+                orig_target = original_targets[seq_idx]
+                
+                # 1. Forward sub-sequences (정방향 서브시퀀스)
+                for end_idx in range(1, 11):
+                    if end_idx == 9:
+                        continue # +40ms target is unknown
+                        
+                    if end_idx == 10:
+                        target = orig_target
+                    else:
+                        target = seq[end_idx + 2]
+                        
+                    for start_idx in range(0, end_idx): # len >= 2
+                        sub_seq = seq[start_idx:end_idx+1]
+                        
+                        pad_len = 11 - len(sub_seq)
+                        if pad_len > 0:
+                            padded_seq = np.vstack([np.tile(sub_seq[0], (pad_len, 1)), sub_seq])
+                        else:
+                            padded_seq = sub_seq
+                            
+                        aug_raw.append(padded_seq)
+                        aug_targets.append(target)
+                        
+                # 2. Reverse sub-sequences (역방향 서브시퀀스)
+                # 예를 들어 -120(idx:7), -160(idx:6), -200(idx:5)을 보고 -280(idx:3)을 예측
+                for start_idx in range(2, 11):
+                    target = seq[start_idx - 2]
+                    
+                    for end_idx in range(start_idx + 1, 11): # len >= 2
+                        # 역방향으로 진행하는 시퀀스 추출
+                        sub_seq = seq[start_idx:end_idx+1][::-1]
+                        
+                        pad_len = 11 - len(sub_seq)
+                        if pad_len > 0:
+                            padded_seq = np.vstack([np.tile(sub_seq[0], (pad_len, 1)), sub_seq])
+                        else:
+                            padded_seq = sub_seq
+                            
+                        aug_raw.append(padded_seq)
+                        aug_targets.append(target)
+                        
+            raw = np.array(aug_raw, dtype=np.float32)
+            target_array = np.array(aug_targets, dtype=np.float32)
+        elif is_train and original_targets is not None:
+            target_array = original_targets
 
         # ── 3. 회전 정규화 + 원점 이동 (벡터 연산) ───────────────────────
         N = len(raw)
@@ -124,10 +188,6 @@ class MosquitoDataset(Dataset):
 
         # ── 5. 라벨 처리 (벡터 연산) ─────────────────────────────────────
         if is_train and labels_df is not None:
-            labels_dict  = labels_df.set_index('id')[['x', 'y', 'z']].T.to_dict('list')
-            target_array = np.array(
-                [labels_dict[fid] for fid in self.file_ids], dtype=np.float32
-            )                                          # (N, 3)
             displacement = target_array - raw[:, -1, :]              # (N, 3)
             # (target - last) @ R.T  →  einsum 'nj,nij->ni'
             self.targets = list(
@@ -152,13 +212,18 @@ class MosquitoDataset(Dataset):
 # 3. Model Definition (GRU 모델 정의)
 # ==========================================
 class MosquitoGRU(nn.Module):
-    def __init__(self, input_size=3, hidden_size=64, num_layers=2, output_size=3):
+    def __init__(self, input_size=3, hidden_size=64, num_layers=2, output_size=3, dropout_rate=0.2):
         super(MosquitoGRU, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         
-        # GRU 레이어
-        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
+        # GRU 레이어 (num_layers > 1 일때 레이어 사이에 dropout 적용)
+        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, 
+                          dropout=dropout_rate if num_layers > 1 else 0)
+        
+        # FC 레이어 전 단일 Dropout
+        self.dropout = nn.Dropout(dropout_rate)
+        
         # Fully Connected 레이어
         self.fc = nn.Linear(hidden_size, output_size)
 
@@ -170,6 +235,9 @@ class MosquitoGRU(nn.Module):
         
         # 마지막 timestep(0ms)의 hidden state만 사용하여 예측
         out = out[:, -1, :] 
+        
+        # Dropout 적용
+        out = self.dropout(out)
         
         # 변위(delta x, delta y, delta z) 예측
         out = self.fc(out)
@@ -206,6 +274,7 @@ def train():
             "input_size":   Config.input_size,
             "hidden_size":  Config.hidden_size,
             "num_layers":   Config.num_layers,
+            "dropout_rate": Config.dropout_rate,
             "output_size":  Config.output_size,
             "batch_size":   Config.batch_size,
             "epochs":       Config.epochs,
@@ -233,10 +302,12 @@ def train():
     train_dataset = MosquitoDataset(train_files, train_labels, is_train=True,
                                     augment_fns=augment_fns,
                                     use_delta=Config.use_delta,
-                                    use_rotation=Config.use_rotation)
+                                    use_rotation=Config.use_rotation,
+                                    subseq_aug=True)
     val_dataset   = MosquitoDataset(val_files, train_labels, is_train=True,
                                     use_delta=Config.use_delta,
-                                    use_rotation=Config.use_rotation)
+                                    use_rotation=Config.use_rotation,
+                                    subseq_aug=False)
     
     train_loader = DataLoader(train_dataset, batch_size=Config.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=Config.batch_size, shuffle=False)
@@ -246,7 +317,8 @@ def train():
         input_size=Config.input_size, 
         hidden_size=Config.hidden_size, 
         num_layers=Config.num_layers,
-        output_size=Config.output_size
+        output_size=Config.output_size,
+        dropout_rate=Config.dropout_rate
     ).to(Config.device)
     
     # 모델 가중치 및 기울기 로그 기록 설정
@@ -279,7 +351,8 @@ def train():
         train_dist = 0.0
         train_correct = 0
 
-        for seq, target in train_loader:
+        train_pbar = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{Config.epochs}] Train", leave=False)
+        for seq, target in train_pbar:
             seq, target = seq.to(Config.device), target.to(Config.device)
 
             optimizer.zero_grad()
@@ -292,6 +365,8 @@ def train():
             train_loss += loss.item() * seq.size(0)
             train_dist += dists.sum().item()
             train_correct += (dists < ACC_THRESHOLD).sum().item()
+            
+            train_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
         n_train = len(train_loader.dataset)
         train_loss /= n_train
@@ -303,8 +378,9 @@ def train():
         val_loss = 0.0
         val_dist = 0.0
         val_correct = 0
+        val_pbar = tqdm(val_loader, desc=f"Epoch [{epoch+1}/{Config.epochs}] Val", leave=False)
         with torch.no_grad():
-            for seq, target in val_loader:
+            for seq, target in val_pbar:
                 seq, target = seq.to(Config.device), target.to(Config.device)
                 outputs = model(seq)
                 loss = criterion(outputs, target)
@@ -373,7 +449,8 @@ def inference(best_val_dist=None, best_epoch=None):
         input_size=Config.input_size, 
         hidden_size=Config.hidden_size, 
         num_layers=Config.num_layers,
-        output_size=Config.output_size
+        output_size=Config.output_size,
+        dropout_rate=Config.dropout_rate
     ).to(Config.device)
     
     if best_epoch is not None and best_val_dist is not None:
