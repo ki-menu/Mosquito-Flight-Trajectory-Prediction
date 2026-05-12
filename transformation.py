@@ -47,50 +47,66 @@ def get_rotation_matrix(coords: np.ndarray) -> np.ndarray:
     return R.astype(np.float32)
 
 
-def apply_transformations(sequences: np.ndarray, targets: np.ndarray = None, 
-                         use_rotation: bool = True, use_delta: bool = False):
+def apply_transformations(sequences: np.ndarray, targets: np.ndarray = None,
+                         use_rotation: bool = True, use_delta: bool = False,
+                         model_mode: str = 'm2o'):
     """
     Apply rotation, translation (origin shift), and optionally delta conversion.
-    
+
     Args:
         sequences: (N, T, 3) array of trajectory coordinates.
-        targets: (N, 3) array of target coordinates (optional).
+        targets: (N, 3) for m2o, or (N, 6) for m2m ([t40, t80], NaN where t40 unknown).
         use_rotation: Whether to rotate sequences to align with x-axis.
         use_delta: Whether to convert positions to displacement vectors (deltas).
-        
+        model_mode: 'm2o' or 'm2m'.
+
     Returns:
-        transformed_sequences: (N, T' , 3)
-        transformed_targets: (N, 3) if targets is provided, else None
+        transformed_sequences: (N, T', 3)
+        transformed_targets: (N, 3) for m2o, (N, 6) for m2m, or None
         last_positions: (N, 3) original last positions before normalization
         rot_mats: (N, 3, 3) rotation matrices used
     """
     N = len(sequences)
-    
-    # 1. Get rotation matrices
+
+    # 1. Rotation matrices
     if use_rotation:
         rot_mats = np.array([get_rotation_matrix(seq) for seq in sequences], dtype=np.float32)
-        # Rotate: (N, T, 3) @ (N, 3, 3).T
         sequences_rot = np.einsum('ntj,nij->nti', sequences, rot_mats)
     else:
         rot_mats = np.tile(np.eye(3, dtype=np.float32), (N, 1, 1))
         sequences_rot = sequences
-    
-    # 2. Origin shift (Last point to origin)
-    last_positions_rot = sequences_rot[:, -1, :]  # (N, 3)
+
+    # 2. Origin shift (last point → origin)
+    last_positions_rot = sequences_rot[:, -1, :]
     sequences_norm = sequences_rot - last_positions_rot[:, np.newaxis, :]
-    
+
     # 3. Delta conversion
     if use_delta:
         sequences_norm = np.diff(sequences_norm, axis=1)
-        
-    # 4. Transform targets if provided
+
+    # 4. Transform targets
     transformed_targets = None
     if targets is not None:
-        # Displacement from last point: (target - last)
-        displacement = targets - sequences[:, -1, :]
-        # Rotate displacement: displacement @ R.T
-        transformed_targets = np.einsum('nj,nij->ni', displacement, rot_mats).astype(np.float32)
-        
+        last_raw = sequences[:, -1, :]  # (N, 3) raw last positions
+
+        if model_mode == 'm2m':
+            # targets shape: (N, 6) — first 3 = t40 (may be NaN), last 3 = t80
+            t40, t80 = targets[:, :3], targets[:, 3:]
+
+            disp_80 = t80 - last_raw
+            trans_t80 = np.einsum('nj,nij->ni', disp_80, rot_mats).astype(np.float32)
+
+            valid = ~np.isnan(t40).any(axis=1)          # (N,) bool
+            trans_t40 = np.full((N, 3), np.nan, dtype=np.float32)
+            if valid.any():
+                disp_40 = t40[valid] - last_raw[valid]
+                trans_t40[valid] = np.einsum('nj,nij->ni', disp_40, rot_mats[valid])
+
+            transformed_targets = np.concatenate([trans_t40, trans_t80], axis=1)
+        else:
+            displacement = targets - last_raw
+            transformed_targets = np.einsum('nj,nij->ni', displacement, rot_mats).astype(np.float32)
+
     return sequences_norm.astype(np.float32), transformed_targets, sequences[:, -1, :].astype(np.float32), rot_mats
 
 

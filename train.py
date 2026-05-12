@@ -11,8 +11,26 @@ from sklearn.model_selection import train_test_split
 import os
 
 from args import Config, set_seed, parse_args, apply_args
-from model import MosquitoGRU, WingLoss
+from model import MosquitoGRU, MosquitoGRU_M2M, WingLoss
 from dataset import MosquitoDataset
+
+
+def compute_step(outputs, targets, criterion, model_mode):
+    """손실과 +80ms 기준 거리를 계산한다. M2M이면 valid한 +40ms도 손실에 포함."""
+    if model_mode == 'm2m':
+        pred_40, pred_80 = outputs[:, :3], outputs[:, 3:]
+        tgt_40, tgt_80 = targets[:, :3], targets[:, 3:]
+        loss_80 = criterion(pred_80, tgt_80)
+        valid_40 = ~torch.isnan(tgt_40).any(dim=1)
+        if valid_40.any():
+            loss = loss_80 + 0.5 * criterion(pred_40[valid_40], tgt_40[valid_40])
+        else:
+            loss = loss_80
+        dists = torch.norm(pred_80.detach() - tgt_80, dim=1)
+    else:
+        loss = criterion(outputs, targets)
+        dists = torch.norm(outputs.detach() - targets, dim=1)
+    return loss, dists
 
 
 def train():
@@ -23,7 +41,8 @@ def train():
         project="DACON-2605-Mosquito-Trajectory",
         name=Config.run_name,
         config={
-            "model":        "GRU",
+            "model":        f"GRU_{Config.model_mode.upper()}",
+            "model_mode":   Config.model_mode,
             "input_size":   Config.input_size,
             "hidden_size":  Config.hidden_size,
             "num_layers":   Config.num_layers,
@@ -58,23 +77,33 @@ def train():
                                     use_rotation=Config.use_rotation,
                                     subseq_aug=True,
                                     subseq_min_len=Config.subseq_min_len,
-                                    subseq_max_len=Config.subseq_max_len)
+                                    subseq_max_len=Config.subseq_max_len,
+                                    model_mode=Config.model_mode)
     val_dataset   = MosquitoDataset(val_files, train_labels, is_train=True,
                                     use_delta=Config.use_delta,
                                     use_rotation=Config.use_rotation,
-                                    subseq_aug=False)
+                                    subseq_aug=False,
+                                    model_mode=Config.model_mode)
     
     train_loader = DataLoader(train_dataset, batch_size=Config.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=Config.batch_size, shuffle=False)
     
     # 모델, 손실함수, 옵티마이저 초기화
-    model = MosquitoGRU(
-        input_size=Config.input_size, 
-        hidden_size=Config.hidden_size, 
-        num_layers=Config.num_layers,
-        output_size=Config.output_size,
-        dropout_rate=Config.dropout_rate
-    ).to(Config.device)
+    if Config.model_mode == 'm2m':
+        model = MosquitoGRU_M2M(
+            input_size=Config.input_size,
+            hidden_size=Config.hidden_size,
+            num_layers=Config.num_layers,
+            dropout_rate=Config.dropout_rate,
+        ).to(Config.device)
+    else:
+        model = MosquitoGRU(
+            input_size=Config.input_size,
+            hidden_size=Config.hidden_size,
+            num_layers=Config.num_layers,
+            output_size=Config.output_size,
+            dropout_rate=Config.dropout_rate,
+        ).to(Config.device)
     
     # 모델 가중치 및 기울기 로그 기록 설정
     wandb.watch(model, log='all', log_freq=100)
@@ -114,11 +143,10 @@ def train():
 
             optimizer.zero_grad()
             outputs = model(seq)
-            loss = criterion(outputs, target)
+            loss, dists = compute_step(outputs, target, criterion, Config.model_mode)
             loss.backward()
             optimizer.step()
 
-            dists = torch.norm(outputs.detach() - target, dim=1)
             train_loss += loss.item() * seq.size(0)
             train_dist += dists.sum().item()
             train_correct += (dists < ACC_THRESHOLD).sum().item()
@@ -140,8 +168,7 @@ def train():
             for seq, target in val_pbar:
                 seq, target = seq.to(Config.device), target.to(Config.device)
                 outputs = model(seq)
-                loss = criterion(outputs, target)
-                dists = torch.norm(outputs - target, dim=1)
+                loss, dists = compute_step(outputs, target, criterion, Config.model_mode)
                 val_loss += loss.item() * seq.size(0)
                 val_dist += dists.sum().item()
                 val_correct += (dists < ACC_THRESHOLD).sum().item()

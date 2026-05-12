@@ -7,20 +7,28 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 
 from args import Config, parse_args, apply_args
-from model import MosquitoGRU
+from model import MosquitoGRU, MosquitoGRU_M2M
 from dataset import MosquitoDataset
 
 
 def inference(model_path=None):
     """추론을 수행하고 submission CSV를 model/ 디렉토리에 저장한다."""
-    # 모델 초기화
-    model = MosquitoGRU(
-        input_size=Config.input_size, 
-        hidden_size=Config.hidden_size, 
-        num_layers=Config.num_layers,
-        output_size=Config.output_size,
-        dropout_rate=Config.dropout_rate
-    ).to(Config.device)
+    # 모델 초기화 (학습 시와 동일한 --model-mode, --input, --no-rotate 인수 필요)
+    if Config.model_mode == 'm2m':
+        model = MosquitoGRU_M2M(
+            input_size=Config.input_size,
+            hidden_size=Config.hidden_size,
+            num_layers=Config.num_layers,
+            dropout_rate=Config.dropout_rate,
+        ).to(Config.device)
+    else:
+        model = MosquitoGRU(
+            input_size=Config.input_size,
+            hidden_size=Config.hidden_size,
+            num_layers=Config.num_layers,
+            output_size=Config.output_size,
+            dropout_rate=Config.dropout_rate,
+        ).to(Config.device)
     
     # 모델 경로 결정
     if model_path is None:
@@ -55,8 +63,9 @@ def inference(model_path=None):
         for seq, last_pos, rot_mat, file_ids in test_loader:
             seq = seq.to(Config.device)
 
-            # 회전 공간에서 변위 예측
-            pred_rotated = model(seq).cpu()  # (B, 3)
+            # 회전 공간에서 변위 예측 (M2M이면 뒤 3개 = +80ms head만 사용)
+            raw_pred = model(seq).cpu()
+            pred_rotated = raw_pred[:, 3:] if Config.model_mode == 'm2m' else raw_pred  # (B, 3)
 
             # 역회전: pred @ R  (학습 시 target @ R.T 로 변환했으므로 R.T의 역행렬 = R)
             pred_displacement = torch.bmm(

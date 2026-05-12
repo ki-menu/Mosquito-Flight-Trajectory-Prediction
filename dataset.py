@@ -19,12 +19,13 @@ class MosquitoDataset(Dataset):
 
     def __init__(self, file_paths, labels_df=None, is_train=True, augment_fns=None,
                  use_delta=False, use_rotation=True, subseq_aug=False,
-                 subseq_min_len=2, subseq_max_len=11):
+                 subseq_min_len=2, subseq_max_len=11, model_mode='m2o'):
         self.is_train = is_train
         self.augment_fns = augment_fns if augment_fns is not None else []
         self.subseq_aug = subseq_aug
         self.subseq_min_len = subseq_min_len
         self.subseq_max_len = subseq_max_len
+        self.model_mode = model_mode
 
         # ── 1. raw sequences 로드 (캐시 우선 → 병렬 I/O) ─────────────────
         self._cache_dir.mkdir(exist_ok=True)
@@ -73,17 +74,23 @@ class MosquitoDataset(Dataset):
         if is_train and original_targets is not None and self.subseq_aug:
             raw, target_array = generate_subsequences(
                 raw, original_targets,
-                min_len=self.subseq_min_len, max_len=self.subseq_max_len
+                min_len=self.subseq_min_len, max_len=self.subseq_max_len,
+                model_mode=model_mode,
             )
         elif is_train and original_targets is not None:
-            target_array = original_targets
+            if model_mode == 'm2m':
+                # val set 등 subseq_aug 없는 경우: target_40 은 NaN 처리
+                nan_t40 = np.full_like(original_targets, np.nan)
+                target_array = np.concatenate([nan_t40, original_targets], axis=1)
+            else:
+                target_array = original_targets
         else:
             target_array = None
 
         # ── 3. Transformation (회전 정규화 + 원점 이동 + Delta) ───────────
-        # transformation.py의 apply_transformations를 통해 일괄 처리
         sequences_norm, transformed_targets, last_positions, rot_mats = apply_transformations(
-            raw, target_array, use_rotation=use_rotation, use_delta=use_delta
+            raw, target_array, use_rotation=use_rotation, use_delta=use_delta,
+            model_mode=model_mode,
         )
 
         self.sequences      = list(sequences_norm)
