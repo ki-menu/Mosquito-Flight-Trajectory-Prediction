@@ -1,196 +1,89 @@
 """
 Data augmentation functions for mosquito 3D flight trajectory.
-
-Each function takes a numpy array of shape (T, 3) representing (x, y, z)
-coordinates over T timesteps, and returns an augmented array of the same shape.
-
-Usage example:
-    import numpy as np
-    import pandas as pd
-    from augmentation import translate_last_to_origin
-
-    df = pd.read_csv("data/train/TRAIN_00001.csv")
-    coords = df[["x", "y", "z"]].values  # shape (T, 3)
-
-    augmented = translate_last_to_origin(coords)
+Focuses on increasing data variety (reversing, sub-sequencing, etc.).
 """
-
 import numpy as np
-
-
-def translate_last_to_origin(coords: np.ndarray) -> np.ndarray:
-    """Translate trajectory so that the last coordinate becomes (0, 0, 0).
-
-    Args:
-        coords: Array of shape (T, 3) with columns [x, y, z].
-
-    Returns:
-        Translated array of the same shape.
-    """
-    offset = coords[-1].copy()
-    return coords - offset
 
 
 def reverse_trajectory(coords: np.ndarray) -> np.ndarray:
     """Augment by reversing the time order of the trajectory.
-
-    Simulates a mosquito travelling the same path in the opposite direction,
-    i.e. from the original endpoint back to the original start point.
-
-    Args:
-        coords: Array of shape (T, 3) with columns [x, y, z].
-
-    Returns:
-        Time-reversed array of the same shape.
+    Simulates a mosquito travelling the same path in the opposite direction.
     """
     return coords[::-1].copy()
 
 
-def get_rotation_matrix(coords: np.ndarray) -> np.ndarray:
-    """Return the 3x3 rotation matrix that aligns the last step direction with the x-axis.
-
-    This is the matrix R used internally by normalize_rotation. Exposing it allows
-    callers to apply the same rotation to paired data (e.g. target labels).
-
-    Args:
-        coords: Array of shape (T, 3) with columns [x, y, z].
-
-    Returns:
-        Rotation matrix of shape (3, 3). Returns identity if direction is degenerate.
-    """
-    direction = coords[-1] - coords[-2]
-    norm = np.linalg.norm(direction)
-    if norm < 1e-8:
-        return np.eye(3, dtype=np.float32)
-
-    v = direction / norm
-    target = np.array([1.0, 0.0, 0.0])
-
-    axis = np.cross(v, target)
-    axis_norm = np.linalg.norm(axis)
-
-    if axis_norm < 1e-8:
-        R = np.eye(3) if np.dot(v, target) > 0 else np.diag([-1.0, -1.0, 1.0])
-        return R.astype(np.float32)
-
-    axis = axis / axis_norm
-    cos_a = np.dot(v, target)
-    sin_a = axis_norm
-
-    K = np.array([
-        [0,       -axis[2],  axis[1]],
-        [axis[2],  0,       -axis[0]],
-        [-axis[1], axis[0],  0      ],
-    ])
-    R = np.eye(3) + sin_a * K + (1 - cos_a) * (K @ K)
-    return R.astype(np.float32)
-
-
-def to_displacement_vectors(coords: np.ndarray) -> np.ndarray:
-    """Convert a coordinate sequence to consecutive displacement vectors.
+def generate_subsequences(raw: np.ndarray, original_targets: np.ndarray,
+                          seq_len: int = 11,
+                          min_len: int = 2,
+                          max_len: int = 11) -> tuple[np.ndarray, np.ndarray]:
+    """전체 시퀀스 배열에서 Forward + Reverse 서브시퀀스 증강을 수행한다.
 
     Args:
-        coords: Array of shape (T, 3) with columns [x, y, z].
+        raw: 원본 시퀀스 배열, shape (N, T, 3).
+        original_targets: 라벨 배열, shape (N, 3).
+        seq_len: GRU에 입력할 고정 시퀀스 길이 (default 11).
+        min_len: 생성할 서브시퀀스의 최소 길이 (default 2).
+        max_len: 생성할 서브시퀀스의 최대 길이 (default 11).
 
     Returns:
-        Array of shape (T-1, 3) where row t is coords[t+1] - coords[t].
+        Tuple of (augmented_raw, augmented_targets):
+            - augmented_raw: shape (M, seq_len, 3)
+            - augmented_targets: shape (M, 3)
     """
-    return np.diff(coords, axis=0).astype(coords.dtype)
+    T = seq_len  # 원본 시퀀스의 총 타임스텝 수
+    aug_raw = []
+    aug_targets = []
 
+    # end_idx는 0-based 인덱스로, 시퀀스 내 마지막 포인트를 가리킴
+    # subsequence 길이 = end_idx - start_idx + 1
+    # min_len, max_len은 이 길이를 제한함
+    fwd_end_range = range(min_len - 1, T)  # end_idx: min_len-1 ~ T-1
 
-def normalize_rotation(coords: np.ndarray) -> np.ndarray:
-    """Rotate trajectory so that the last step direction aligns with the x-axis.
+    for seq_idx, seq in enumerate(raw):
+        orig_target = original_targets[seq_idx]
 
-    Args:
-        coords: Array of shape (T, 3) with columns [x, y, z].
+        # 1. Forward sub-sequences (정방향 서브시퀀스)
+        for end_idx in fwd_end_range:
+            if end_idx == T - 2:
+                continue  # +40ms target is unknown (index T-2 = idx 9)
 
-    Returns:
-        Rotated array of the same shape.
-    """
-    return coords @ get_rotation_matrix(coords).T
+            if end_idx == T - 1:
+                target = orig_target
+            else:
+                target = seq[end_idx + 2]
 
+            # start_idx 범위: subsequence 길이가 min_len~max_len 이 되도록
+            start_min = max(0, end_idx - max_len + 1)
+            start_max = end_idx - min_len + 1
+            for start_idx in range(start_min, start_max + 1):
+                sub_seq = seq[start_idx:end_idx + 1]
 
-def compute_velocity_acceleration(
-    coords: np.ndarray, dt: float = 1.0
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute velocity and acceleration features from coordinate trajectory.
+                pad_len = seq_len - len(sub_seq)
+                if pad_len > 0:
+                    padded_seq = np.vstack([np.tile(sub_seq[0], (pad_len, 1)), sub_seq])
+                else:
+                    padded_seq = sub_seq
 
-    Uses forward differences. Note that differentiation reduces sequence length.
+                aug_raw.append(padded_seq)
+                aug_targets.append(target)
 
-    Args:
-        coords: Array of shape (T, 3) with columns [x, y, z].
-        dt: Time step between consecutive samples in seconds (default 1.0).
+        # 2. Reverse sub-sequences (역방향 서브시퀀스)
+        for start_idx in range(min_len, T):
+            target = seq[start_idx - 2]
 
-    Returns:
-        Tuple of (velocity, acceleration):
-            - velocity: shape (T-1, 3)
-            - acceleration: shape (T-2, 3)
-    """
-    velocity = np.diff(coords, axis=0) / dt
-    acceleration = np.diff(velocity, axis=0) / dt
+            # end_idx 범위: subsequence 길이가 min_len~max_len 이 되도록
+            end_min = start_idx + min_len - 1
+            end_max = min(T - 1, start_idx + max_len - 1)
+            for end_idx in range(end_min, end_max + 1):
+                sub_seq = seq[start_idx:end_idx + 1][::-1]
 
-    return velocity, acceleration
+                pad_len = seq_len - len(sub_seq)
+                if pad_len > 0:
+                    padded_seq = np.vstack([np.tile(sub_seq[0], (pad_len, 1)), sub_seq])
+                else:
+                    padded_seq = sub_seq
 
+                aug_raw.append(padded_seq)
+                aug_targets.append(target)
 
-def remove_speed_outliers(
-    coords: np.ndarray, threshold: float = 3.0, dt: float = 1.0
-) -> np.ndarray:
-    """Replace positions where instantaneous speed exceeds threshold via linear interpolation.
-
-    Speed is estimated as ||coords[t+1] - coords[t]|| / dt. Any point t+1 whose
-    incoming speed exceeds the threshold is replaced by linearly interpolating between
-    the nearest valid (non-outlier) neighbors. The first and last points are never
-    replaced to preserve trajectory bounds.
-
-    Args:
-        coords: Array of shape (T, 3) with columns [x, y, z].
-        threshold: Speed threshold in m/s; steps above this are replaced (default 3.0).
-        dt: Time step between consecutive samples in seconds (default 1.0).
-
-    Returns:
-        Cleaned array of the same shape.
-    """
-    result = coords.copy()
-    T = len(coords)
-
-    speeds = np.linalg.norm(np.diff(coords, axis=0), axis=1) / dt  # shape (T-1,)
-
-    outlier = np.zeros(T, dtype=bool)
-    outlier[1:] = speeds > threshold
-    outlier[0] = False
-    outlier[-1] = False
-
-    for idx in np.where(outlier)[0]:
-        prev = idx - 1
-        while prev > 0 and outlier[prev]:
-            prev -= 1
-
-        nxt = idx + 1
-        while nxt < T - 1 and outlier[nxt]:
-            nxt += 1
-
-        alpha = (idx - prev) / (nxt - prev)
-        result[idx] = coords[prev] * (1 - alpha) + coords[nxt] * alpha
-
-    return result
-
-
-def normalize_speed_scale(coords: np.ndarray, dt: float = 1.0) -> np.ndarray:
-    """Normalize trajectory coordinates by the median instantaneous speed.
-
-    Computes median speed across all timesteps as the characteristic speed scale,
-    then divides all coordinates by that scale so trajectories of different absolute
-    speeds become comparable.
-
-    Args:
-        coords: Array of shape (T, 3) with columns [x, y, z].
-        dt: Time step between consecutive samples in seconds (default 1.0).
-
-    Returns:
-        Normalized array of the same shape (units: original_unit / (m/s)).
-    """
-    speeds = np.linalg.norm(np.diff(coords, axis=0), axis=1) / dt
-    scale = np.median(speeds)
-    if scale < 1e-8:
-        return coords.copy()
-    return coords / scale
+    return np.array(aug_raw, dtype=np.float32), np.array(aug_targets, dtype=np.float32)
