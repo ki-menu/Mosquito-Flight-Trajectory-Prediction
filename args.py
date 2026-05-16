@@ -42,7 +42,7 @@ class Config:
     lr = 1e-3
     min_lr = 1e-6          # LR 하한선 설정
     scheduler_factor = 0.5 # 감쇠 폭 완화 (0.1 -> 0.5)
-    patience = 40          
+    patience = 30          
     warmup_epochs = 10     # 초기 Warm-up 에폭 수
 
     seed = 42

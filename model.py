@@ -61,7 +61,7 @@ class PhysicsInformedLoss(nn.Module):
         lambda_dir: 방향 일관성 패널티 가중치.
         lambda_speed: 속도 크기 일관성 패널티 가중치.
     """
-    def __init__(self, w=0.03, epsilon=0.005,
+    def __init__(self, w=0.02, epsilon=0.005,
                  use_delta=True, dt=0.040, pred_horizon=0.080,
                  d_max=None,
                  lambda_vel=0.1,
