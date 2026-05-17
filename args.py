@@ -52,6 +52,11 @@ class Config:
     subseq_min_len = 2
     subseq_max_len = 11
 
+    # 모델 출력 모드
+    # 'm2o': +80ms 단일 예측 (output 3D)
+    # 'm2m': +40ms, +80ms 동시 예측 (output 6D, 제출엔 뒤 3D만 사용)
+    model_mode = 'm2o'
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -79,6 +84,10 @@ def parse_args():
     parser.add_argument('--subseq-max', type=int, default=11,
                         help="Sub-sequence 증강 최대 길이 (default: 11)")
 
+    parser.add_argument('--model-mode', type=str, default='m2o', choices=['m2o', 'm2m'],
+                        help="Model output mode: 'm2o' (+80ms 단일 예측, default) or "
+                             "'m2m' (+40ms, +80ms 동시 예측 — 제출엔 +80ms head만 사용)")
+
     parser.add_argument('--model_path', type=str, default=None,
                         help="Specific model path for inference")
 
@@ -95,6 +104,7 @@ def apply_args(args):
     Config.use_rotation = args.rotate
     Config.subseq_min_len = args.subseq_min
     Config.subseq_max_len = args.subseq_max
+    Config.model_mode   = args.model_mode
 
     # 디바이스 설정
     if args.device == 'auto':
