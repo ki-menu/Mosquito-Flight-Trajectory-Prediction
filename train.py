@@ -11,26 +11,46 @@ from sklearn.model_selection import train_test_split
 import os
 
 from args import Config, set_seed, parse_args, apply_args
-from model import MosquitoGRU, MosquitoGRU_M2M, WingLoss
+from model import MosquitoGRU, MosquitoGRU_M2M, WingLoss, CombinedLoss
 from dataset import MosquitoDataset
 
 
 def compute_step(outputs, targets, criterion, model_mode):
-    """손실과 +80ms 기준 거리를 계산한다. M2M이면 valid한 +40ms도 손실에 포함."""
+    """손실과 +80ms 기준 거리를 계산한다. M2M이면 valid한 +40ms도 손실에 포함.
+
+    CombinedLoss일 경우 (loss, loss_dict) 틀플을 반환하므로 이를 처리.
+    """
+    is_combined = isinstance(criterion, CombinedLoss)
+
     if model_mode == 'm2m':
         pred_40, pred_80 = outputs[:, :3], outputs[:, 3:]
         tgt_40, tgt_80 = targets[:, :3], targets[:, 3:]
-        loss_80 = criterion(pred_80, tgt_80)
+
+        if is_combined:
+            loss_80, loss_dict = criterion(pred_80, tgt_80)
+        else:
+            loss_80 = criterion(pred_80, tgt_80)
+            loss_dict = None
+
         valid_40 = ~torch.isnan(tgt_40).any(dim=1)
         if valid_40.any():
-            loss = loss_80 + 0.5 * criterion(pred_40[valid_40], tgt_40[valid_40])
+            if is_combined:
+                loss_40, _ = criterion(pred_40[valid_40], tgt_40[valid_40])
+            else:
+                loss_40 = criterion(pred_40[valid_40], tgt_40[valid_40])
+            loss = loss_80 + 0.5 * loss_40
         else:
             loss = loss_80
         dists = torch.norm(pred_80.detach() - tgt_80, dim=1)
     else:
-        loss = criterion(outputs, targets)
+        if is_combined:
+            loss, loss_dict = criterion(outputs, targets)
+        else:
+            loss = criterion(outputs, targets)
+            loss_dict = None
         dists = torch.norm(outputs.detach() - targets, dim=1)
-    return loss, dists
+
+    return loss, dists, loss_dict
 
 
 def train():
@@ -55,6 +75,9 @@ def train():
             "use_delta":    Config.use_delta,
             "use_rotation": Config.use_rotation,
             "patience":     Config.patience,
+            "use_hit_loss": Config.use_hit_loss,
+            "sigma_beam":   Config.sigma_beam,
+            "sigma_mosquito": Config.sigma_mosquito,
         },
     )
 
@@ -108,7 +131,24 @@ def train():
     # 모델 가중치 및 기울기 로그 기록 설정
     wandb.watch(model, log='all', log_freq=100)
     
-    criterion = WingLoss(w=0.03, epsilon=0.005)
+    # 손실함수 초기화 (Hit Loss 사용 여부에 따라 분기)
+    if Config.use_hit_loss:
+        criterion = CombinedLoss(
+            wing_w=Config.wing_w, wing_epsilon=Config.wing_epsilon,
+            sigma_beam=Config.sigma_beam,
+            sigma_mosquito=Config.sigma_mosquito,
+            transition_start=Config.transition_start,
+            transition_end=Config.transition_end,
+            alpha_min=Config.alpha_min,
+            beta_min=Config.beta_min,
+        ).to(Config.device)
+        print(f"Using CombinedLoss (WingLoss + GaussianHitLoss) with curriculum learning")
+        print(f"  wing_w={Config.wing_w}, wing_epsilon={Config.wing_epsilon}")
+        print(f"  sigma_beam={Config.sigma_beam}, sigma_mosquito={Config.sigma_mosquito}")
+        print(f"  transition: {Config.transition_start:.0%} ~ {Config.transition_end:.0%}")
+    else:
+        criterion = WingLoss(w=Config.wing_w, epsilon=Config.wing_epsilon)
+        print(f"Using WingLoss only (w={Config.wing_w})")
     optimizer = torch.optim.Adam(model.parameters(), lr=Config.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
@@ -131,7 +171,12 @@ def train():
             curr_lr = Config.lr * (epoch + 1) / Config.warmup_epochs
             for param_group in optimizer.param_groups:
                 param_group['lr'] = curr_lr
-        
+
+        # ── 1.5. Curriculum Learning 진행률 갱신 ─────────────────────
+        if isinstance(criterion, CombinedLoss):
+            progress = epoch / Config.epochs
+            criterion.set_progress(progress)
+
         model.train()
         train_loss = 0.0
         train_dist = 0.0
@@ -143,7 +188,7 @@ def train():
 
             optimizer.zero_grad()
             outputs = model(seq)
-            loss, dists = compute_step(outputs, target, criterion, Config.model_mode)
+            loss, dists, loss_dict = compute_step(outputs, target, criterion, Config.model_mode)
             loss.backward()
             optimizer.step()
 
@@ -168,7 +213,7 @@ def train():
             for seq, target in val_pbar:
                 seq, target = seq.to(Config.device), target.to(Config.device)
                 outputs = model(seq)
-                loss, dists = compute_step(outputs, target, criterion, Config.model_mode)
+                loss, dists, _ = compute_step(outputs, target, criterion, Config.model_mode)
                 val_loss += loss.item() * seq.size(0)
                 val_dist += dists.sum().item()
                 val_correct += (dists < ACC_THRESHOLD).sum().item()
@@ -183,7 +228,7 @@ def train():
               f"Train Dist: {train_dist:.4f}  Val Dist: {val_dist:.4f} | "
               f"Train Acc: {train_acc:.4f}  Val Acc: {val_acc:.4f}")
 
-        wandb.log({
+        log_dict = {
             "epoch":         epoch + 1,
             "train/loss":    train_loss,
             "train/dist":    train_dist,
@@ -192,7 +237,22 @@ def train():
             "val/dist":      val_dist,
             "val/acc":       val_acc,
             "learning_rate": optimizer.param_groups[0]['lr'],
-        })
+        }
+
+        # CombinedLoss일 경우 curriculum 가중치 및 개별 loss 로깅
+        if isinstance(criterion, CombinedLoss):
+            log_dict.update({
+                "curriculum/alpha": criterion.alpha,
+                "curriculum/beta":  criterion.beta,
+            })
+            # 마지막 배치의 loss_dict를 로깅 (대표값)
+            if loss_dict is not None:
+                log_dict.update({
+                    "train/wing_loss": loss_dict.get('wing_loss', 0),
+                    "train/hit_loss":  loss_dict.get('hit_loss', 0),
+                })
+
+        wandb.log(log_dict)
 
         # 스케줄러 업데이트 (Warm-up 이후에만 작동하도록 설정 가능)
         if epoch >= Config.warmup_epochs:

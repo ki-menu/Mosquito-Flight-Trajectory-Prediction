@@ -12,7 +12,7 @@ from dataset import MosquitoDataset
 
 
 def inference(model_path=None):
-    """추론을 수행하고 submission CSV를 model/ 디렉토리에 저장한다."""
+    """추론을 수행하고 submission CSV를 result/ 디렉토리에 저장한다."""
     # 모델 초기화 (학습 시와 동일한 --model-mode, --input, --no-rotate 인수 필요)
     if Config.model_mode == 'm2m':
         model = MosquitoGRU_M2M(
@@ -35,7 +35,7 @@ def inference(model_path=None):
         # model 폴더에서 가장 성능이 좋은(Dist가 낮은) 파일 검색
         save_files = list(Config.output_dir.glob('gru_*_*.pth'))
         if not save_files:
-            raise FileNotFoundError("학습된 모델 파일을 찾을 수 없습니다. (model/gru_*.pth)")
+            raise FileNotFoundError("학습된 모델 파일을 찾을 수 없습니다. (result/gru_*.pth)")
         
         # 파일명 형식: gru_{dist}_{epoch}.pth -> dist(두 번째 요소)가 가장 작은 것 선택
         def get_dist(path):
@@ -84,7 +84,7 @@ def inference(model_path=None):
                     'z': pred_pos[i, 2]
                 })
                 
-    # 제출 형식에 맞게 병합 후 저장 (model/ 디렉토리에 저장)
+    # 제출 형식에 맞게 병합 후 저장 (result/ 디렉토리에 저장)
     pred_df = pd.DataFrame(predictions)
     sample_sub = pd.read_csv(Config.sample_sub_path)
     submission = sample_sub[['id']].merge(pred_df, on='id', how='left')
