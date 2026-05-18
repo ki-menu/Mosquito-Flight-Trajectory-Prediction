@@ -55,6 +55,8 @@ def train():
             "use_delta":    Config.use_delta,
             "use_rotation": Config.use_rotation,
             "patience":     Config.patience,
+            "wing_w":       Config.wing_w,
+            "wing_e":       Config.wing_e,
         },
     )
 
@@ -108,7 +110,7 @@ def train():
     # 모델 가중치 및 기울기 로그 기록 설정
     wandb.watch(model, log='all', log_freq=100)
     
-    criterion = WingLoss(w=0.03, epsilon=0.005)
+    criterion = WingLoss(w=Config.wing_w, epsilon=Config.wing_e)
     optimizer = torch.optim.Adam(model.parameters(), lr=Config.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
@@ -121,9 +123,11 @@ def train():
     ACC_THRESHOLD = 0.01  # 정답 인정 거리 기준 (m)
     best_val_loss = float('inf')
     best_val_dist_total = float('inf')
+    best_val_acc_total = 0.0
     best_epoch = 0
 
-    Config.output_dir.mkdir(exist_ok=True)
+    result_dir = Path('./result')
+    result_dir.mkdir(exist_ok=True)
 
     for epoch in range(Config.epochs):
         # ── 1. Warm-up 전략 적용 ──────────────────────────────────────
@@ -198,26 +202,37 @@ def train():
         if epoch >= Config.warmup_epochs:
             scheduler.step(val_loss)
 
-        # 성능이 개선되면 모델 저장 (임시 저장)
+        # ── 임시 저장: val_loss 최저 ──────────────────────────────────
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_val_dist_total = val_dist
             best_epoch = epoch + 1
-            
-            # 중간에 꺼질 수 있으므로 임시 파일로 계속 갱신
-            torch.save(model.state_dict(), Config.output_dir / 'best_model_tmp.pth')
-            
-            print(f"  --> Updated best model (Epoch {best_epoch}, Loss: {best_val_loss:.6f})")
+            torch.save(model.state_dict(), result_dir / 'best_loss_tmp.pth')
+            print(f"  --> [Loss]  Best val_loss={best_val_loss:.6f}  (Epoch {best_epoch})")
             wandb.summary["best_val_loss"] = best_val_loss
-            wandb.summary["best_val_dist"] = best_val_dist_total
-            wandb.summary["best_val_acc"]  = val_acc
-            wandb.summary["best_epoch"]    = best_epoch
+            wandb.summary["best_epoch_loss"] = best_epoch
             wandb.summary["patience"]      = Config.patience
 
-    # 학습 종료 후 최종 파일명으로 변경 (Dist값과 에폭 포함)
+        # ── 임시 저장: val_dist 최저 ─────────────────────────────────
+        if val_dist < best_val_dist_total or (val_dist == best_val_dist_total and val_loss < best_val_loss):
+            best_val_dist_total = val_dist
+            torch.save(model.state_dict(), result_dir / 'best_dist_tmp.pth')
+            print(f"  --> [Dist]  Best val_dist={best_val_dist_total:.6f}  (Epoch {epoch+1})")
+            wandb.summary["best_val_dist"]       = best_val_dist_total
+            wandb.summary["best_epoch_dist"]     = epoch + 1
+
+        # ── 임시 저장: val_acc 최고 ──────────────────────────────────
+        if val_acc > best_val_acc_total:
+            best_val_acc_total = val_acc
+            torch.save(model.state_dict(), result_dir / 'best_acc_tmp.pth')
+            print(f"  --> [Acc]   Best val_acc={best_val_acc_total:.6f}  (Epoch {epoch+1})")
+            wandb.summary["best_val_acc"]        = best_val_acc_total
+            wandb.summary["best_epoch_acc"]      = epoch + 1
+
+    # 학습 종료 후 최종 파일명으로 변경 — val_loss 기준 모델만 rename
     if best_epoch > 0:
-        final_model_path = Config.output_dir / f'gru_{best_val_dist_total:.4f}_{best_epoch}.pth'
-        os.rename(Config.output_dir / 'best_model_tmp.pth', final_model_path)
+        final_model_path = result_dir / f'gru_{best_val_dist_total:.4f}_{best_epoch}.pth'
+        os.rename(result_dir / 'best_loss_tmp.pth', final_model_path)
         print(f"\nTraining complete. Final best model saved to: {final_model_path}")
 
     wandb.finish()

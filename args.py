@@ -45,6 +45,10 @@ class Config:
     patience = 30          
     warmup_epochs = 10     # 초기 Warm-up 에폭 수
 
+    # WingLoss 하이퍼파라미터
+    wing_w = 0.03
+    wing_e = 0.005
+
     seed = 42
     run_name = "GRU"  # wandb 실행 이름
 
@@ -88,6 +92,11 @@ def parse_args():
                         help="Model output mode: 'm2o' (+80ms 단일 예측, default) or "
                              "'m2m' (+40ms, +80ms 동시 예측 — 제출엔 +80ms head만 사용)")
 
+    parser.add_argument('--wing-w', type=float, default=0.03,
+                        help="WingLoss w 파라미터 (flat 구간 너비, default: 0.03)")
+    parser.add_argument('--wing-e', type=float, default=0.005,
+                        help="WingLoss epsilon 파라미터 (곡률 조절, default: 0.005)")
+
     parser.add_argument('--model_path', type=str, default=None,
                         help="Specific model path for inference")
 
@@ -105,6 +114,8 @@ def apply_args(args):
     Config.subseq_min_len = args.subseq_min
     Config.subseq_max_len = args.subseq_max
     Config.model_mode   = args.model_mode
+    Config.wing_w       = args.wing_w
+    Config.wing_e       = args.wing_e
 
     # 디바이스 설정
     if args.device == 'auto':
