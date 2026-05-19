@@ -141,7 +141,7 @@ class CombinedLoss(nn.Module):
         beta_min: 학습 초기 HitLoss 최소 가중치.
     """
     def __init__(self, wing_w=0.03, wing_epsilon=0.005,
-                 sigma_beam=0.005, sigma_mosquito=0.002,
+                 sigma_beam=0.008, sigma_mosquito=0.003,
                  transition_start=0.3, transition_end=0.7,
                  alpha_min=0.3, beta_min=0.05):
         super().__init__()
