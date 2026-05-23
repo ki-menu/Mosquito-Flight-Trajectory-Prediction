@@ -65,10 +65,10 @@ class Config:
     use_hit_loss = True           # CombinedLoss 사용 여부 (False면 기존 WingLoss만)
     sigma_beam = 0.005            # 레이저 빔 유효 표준편차 (m), 대회 기준 0.01m 기반
     sigma_mosquito = 0.002        # 모기 유효 크기 표준편차 (m)
-    transition_start = 50 / 300   # Curriculum 전환 시작 비율 (50 epoch까지 1단계)
-    transition_end = 150 / 300    # Curriculum 전환 완료 비율 (150 epoch까지 2단계)
-    alpha_min = 0.3               # WingLoss 최소 가중치 (전환 후)
-    beta_min = 0.05               # HitLoss 초기 가중치 (전환 전)
+    transition_start = 1.1        # Curriculum 비활성화 (>1.0 → 항상 고정 가중치 유지)
+    transition_end = 1.1          # Curriculum 비활성화
+    alpha_min = 1.0               # WingLoss 고정 가중치 (α)
+    beta_min = 0.005              # HitLoss 고정 가중치 (β)
 
 
 def parse_args():
@@ -115,6 +115,10 @@ def parse_args():
                         help="Override sigma_beam for GaussianHitLoss (default: 0.005)")
     parser.add_argument('--sigma-mosquito', type=float, default=None,
                         help="Override sigma_mosquito for GaussianHitLoss (default: 0.002)")
+    parser.add_argument('--alpha', type=float, default=None,
+                        help="WingLoss 고정 가중치 α (default: 1.0). Curriculum 비활성화됨")
+    parser.add_argument('--beta', type=float, default=None,
+                        help="GaussianHitLoss 고정 가중치 β (default: 0.005). Curriculum 비활성화됨")
 
     parser.set_defaults(rotate=True, use_hit_loss=True)
 
@@ -141,6 +145,10 @@ def apply_args(args):
         Config.sigma_beam = args.sigma_beam
     if args.sigma_mosquito is not None:
         Config.sigma_mosquito = args.sigma_mosquito
+    if args.alpha is not None:
+        Config.alpha_min = args.alpha
+    if args.beta is not None:
+        Config.beta_min = args.beta
 
     # 디바이스 설정
     if args.device == 'auto':
