@@ -12,6 +12,69 @@ def reverse_trajectory(coords: np.ndarray) -> np.ndarray:
     return coords[::-1].copy()
 
 
+# ============================================================
+# 기하학적 증강 (Geometric Augmentations)
+# ============================================================
+
+def _rotate_z(coords: np.ndarray, deg: float) -> np.ndarray:
+    """Z축 기준 deg도 회전. coords: (..., 3)."""
+    theta = np.radians(deg)
+    c, s = float(np.cos(theta)), float(np.sin(theta))
+    R = np.array([[c, -s, 0.0],
+                  [s,  c, 0.0],
+                  [0.0, 0.0, 1.0]], dtype=np.float32)
+    return (coords @ R.T).astype(np.float32)
+
+
+def _reflect(coords: np.ndarray, axis: str) -> np.ndarray:
+    """평면 반사. axis='x': yz평면(x*=-1), 'y': xz평면(y*=-1). coords: (..., 3)."""
+    result = coords.copy()
+    result[..., {'x': 0, 'y': 1, 'z': 2}[axis]] *= -1
+    return result.astype(np.float32)
+
+
+def apply_geometric_augmentations(
+    raw: np.ndarray,
+    original_targets: np.ndarray,
+    rotations: tuple = (0, 90, 180, 270),
+    flips: tuple = ('none', 'y', 'x'),
+) -> tuple[np.ndarray, np.ndarray]:
+    """기하학적 변환(Z축 회전 × 반사)으로 시퀀스와 타겟을 동시에 확장한다.
+
+    시퀀스와 타겟에 동일한 변환을 적용하므로 라벨 일관성이 유지된다.
+    (0도 회전 + 반사 없음) 조합이 원본 데이터에 해당한다.
+
+    Args:
+        raw: 원본 시퀀스 (N, T, 3).
+        original_targets: 라벨 (N, 3).
+        rotations: Z축 회전 각도 목록 (도). 예: (0, 90, 180, 270).
+        flips: 반사 목록. 'none'=없음, 'x'=yz평면, 'y'=xz평면.
+
+    Returns:
+        aug_raw:     (N * k, T, 3)   k = len(rotations) * len(flips)
+        aug_targets: (N * k, 3)
+    """
+    aug_raws = []
+    aug_tgts = []
+
+    for rot in rotations:
+        r_raw = _rotate_z(raw, rot)              # (N, T, 3)
+        r_tgt = _rotate_z(original_targets, rot)  # (N, 3)
+
+        for flip in flips:
+            if flip == 'none':
+                aug_raws.append(r_raw)
+                aug_tgts.append(r_tgt)
+            else:
+                aug_raws.append(_reflect(r_raw, flip))
+                aug_tgts.append(_reflect(r_tgt, flip))
+
+    return (
+        np.concatenate(aug_raws, axis=0),   # (N*k, T, 3)
+        np.concatenate(aug_tgts, axis=0),   # (N*k, 3)
+    )
+
+
 def generate_subsequences(raw: np.ndarray, original_targets: np.ndarray,
                           seq_len: int = 11,
                           min_len: int = 2,

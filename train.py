@@ -101,7 +101,10 @@ def train():
                                     subseq_aug=True,
                                     subseq_min_len=Config.subseq_min_len,
                                     subseq_max_len=Config.subseq_max_len,
-                                    model_mode=Config.model_mode)
+                                    model_mode=Config.model_mode,
+                                    geo_aug=Config.geo_aug,
+                                    geo_rotations=Config.geo_rotations,
+                                    geo_flips=Config.geo_flips)
     val_dataset   = MosquitoDataset(val_files, train_labels, is_train=True,
                                     use_delta=Config.use_delta,
                                     use_rotation=Config.use_rotation,

@@ -36,7 +36,7 @@ class Config:
     dropout_rate = 0.2
 
     # 학습 설정
-    batch_size = 64
+    batch_size = 256
     epochs = 300
 
     lr = 1e-3
@@ -56,6 +56,11 @@ class Config:
     # 'm2o': +80ms 단일 예측 (output 3D)
     # 'm2m': +40ms, +80ms 동시 예측 (output 6D, 제출엔 뒤 3D만 사용)
     model_mode = 'm2o'
+
+    # 기하학적 증강 (Geometric Augmentation)
+    geo_aug       = False                  # --geo-aug: 활성화 여부
+    geo_rotations = (0, 90, 180, 270)     # --geo-rot: Z축 회전 각도 목록
+    geo_flips     = ('none', 'y', 'x')    # --geo-flip: 반사 목록
 
     # WingLoss 관련 하이퍼파라미터
     wing_w = 0.02                 # WingLoss w 파라미터 (원래 0.03)
@@ -101,6 +106,15 @@ def parse_args():
                         help="Model output mode: 'm2o' (+80ms 단일 예측, default) or "
                              "'m2m' (+40ms, +80ms 동시 예측 — 제출엔 +80ms head만 사용)")
 
+    parser.add_argument('--geo-aug', action='store_true', default=False,
+                        help="기하 증강 활성화: Z축 회전 × 반사 조합 (default: OFF)")
+    parser.add_argument('--geo-rot', type=int, nargs='+', default=[0, 90, 180, 270],
+                        metavar='DEG',
+                        help="Z축 회전 각도 목록 (default: 0 90 180 270)")
+    parser.add_argument('--geo-flip', type=str, nargs='+', default=['none', 'y', 'x'],
+                        choices=['none', 'x', 'y'], metavar='PLANE',
+                        help="반사 목록: none/x(yz평면)/y(xz평면) (default: none y x)")
+
     parser.add_argument('--model_path', type=str, default=None,
                         help="Specific model path for inference")
 
@@ -134,6 +148,9 @@ def apply_args(args):
     Config.subseq_min_len = args.subseq_min
     Config.subseq_max_len = args.subseq_max
     Config.model_mode   = args.model_mode
+    Config.geo_aug       = args.geo_aug
+    Config.geo_rotations = tuple(args.geo_rot)
+    Config.geo_flips     = tuple(args.geo_flip)
 
     # WingLoss 설정 반영
     if hasattr(args, 'wing_w') and args.wing_w is not None:

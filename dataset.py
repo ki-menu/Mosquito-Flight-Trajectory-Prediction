@@ -10,7 +10,7 @@ from pathlib import Path
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 
-from augmentation import generate_subsequences
+from augmentation import generate_subsequences, apply_geometric_augmentations
 from transformation import apply_transformations
 
 
@@ -19,7 +19,8 @@ class MosquitoDataset(Dataset):
 
     def __init__(self, file_paths, labels_df=None, is_train=True, augment_fns=None,
                  use_delta=False, use_rotation=True, subseq_aug=False,
-                 subseq_min_len=2, subseq_max_len=11, model_mode='m2o'):
+                 subseq_min_len=2, subseq_max_len=11, model_mode='m2o',
+                 geo_aug=False, geo_rotations=(0, 90, 180, 270), geo_flips=('none', 'y', 'x')):
         self.is_train = is_train
         self.augment_fns = augment_fns if augment_fns is not None else []
         self.subseq_aug = subseq_aug
@@ -60,6 +61,17 @@ class MosquitoDataset(Dataset):
             )
         else:
             original_targets = None
+
+        # ── 1.7. 기하학적 증강 (시퀀스 + 타겟 동시 변환) ─────────────────
+        if is_train and original_targets is not None and geo_aug:
+            k = len(geo_rotations) * len(geo_flips)
+            raw, original_targets = apply_geometric_augmentations(
+                raw, original_targets,
+                rotations=geo_rotations,
+                flips=geo_flips,
+            )
+            self.file_ids = self.file_ids * k  # 확장된 N에 맞게 file_ids도 반복
+            print(f"기하 증강 완료: {k}× 확장 → {len(raw)} 시퀀스")
 
         # ── 2. augmentation (학습 시에만, raw에 적용) ─────────────────────
         if is_train and self.augment_fns:
