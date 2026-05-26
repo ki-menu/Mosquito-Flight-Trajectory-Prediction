@@ -268,7 +268,15 @@ def train():
             best_epoch = epoch + 1
             
             # 중간에 꺼질 수 있으므로 임시 파일로 계속 갱신
-            torch.save(model.state_dict(), Config.output_dir / 'best_model_tmp.pth')
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'input_mode':   Config.input_mode,
+                'input_size':   Config.input_size,
+                'model_mode':   Config.model_mode,
+                'use_rotation': Config.use_rotation,
+                'hidden_size':  Config.hidden_size,
+                'num_layers':   Config.num_layers,
+            }, Config.output_dir / 'best_model_tmp.pth')
             
             print(f"  --> Updated best model (Epoch {best_epoch}, Loss: {best_val_loss:.6f})")
             wandb.summary["best_val_loss"] = best_val_loss
