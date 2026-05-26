@@ -27,9 +27,12 @@ class Config:
     sample_sub_path = data_dir / 'sample_submission.csv'
     output_dir = Path('./result')  # 모델 & 결과 모두 여기에 저장
 
+    # 입력 모드 ('raw', 'delta', 'vel', 'vel+acc')
+    input_mode = 'delta'
+
     # 모델 하이퍼파라미터
-    input_size = 3 
-    output_size = 3   
+    input_size = 3       # input_mode에 따라 apply_args()에서 자동 설정
+    output_size = 3
 
     hidden_size = 64
     num_layers = 3
@@ -89,9 +92,12 @@ def parse_args():
                         help="Wandb run name (default: from Config)")
 
     parser.add_argument('--input', type=str, default='delta',
-                        choices=['raw', 'delta'],
-                        help="Input type: 'raw' (11×3 coords) or "
-                             "'delta' (10×3 displacement vectors, default)")
+                        choices=['raw', 'delta', 'vel', 'vel+acc'],
+                        help="Input feature mode:\n"
+                             "  raw     : 11×3 position coords\n"
+                             "  delta   : 10×3 displacement vectors (default)\n"
+                             "  vel     : 11×6 position + velocity (zero-padded)\n"
+                             "  vel+acc : 11×9 position + velocity + acceleration (zero-padded)")
             
     parser.add_argument('--no-rotate', dest='rotate', action='store_false',
                         help="Disable rotation normalization (last-step → +x axis). "
@@ -143,7 +149,9 @@ def apply_args(args):
     """Parse된 args를 Config에 반영한다."""
     if args.name:
         Config.run_name = args.name
-    Config.use_delta    = (args.input == 'delta')
+    Config.input_mode   = args.input
+    Config.use_delta    = (args.input == 'delta')  # 하위 호환성 유지
+    Config.input_size   = {'raw': 3, 'delta': 3, 'vel': 6, 'vel+acc': 9}[args.input]
     Config.use_rotation = args.rotate
     Config.subseq_min_len = args.subseq_min
     Config.subseq_max_len = args.subseq_max

@@ -53,7 +53,7 @@ def inference(model_path=None):
     # Test 데이터셋 로드
     test_files = sorted(list(Config.test_dir.glob('TEST_*.csv')))
     test_dataset = MosquitoDataset(test_files, is_train=False,
-                                   use_delta=Config.use_delta,
+                                   input_mode=Config.input_mode,
                                    use_rotation=Config.use_rotation)
     test_loader = DataLoader(test_dataset, batch_size=Config.batch_size, shuffle=False)
     

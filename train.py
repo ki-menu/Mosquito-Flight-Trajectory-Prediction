@@ -63,6 +63,7 @@ def train():
         config={
             "model":        f"GRU_{Config.model_mode.upper()}",
             "model_mode":   Config.model_mode,
+            "input_mode":   Config.input_mode,
             "input_size":   Config.input_size,
             "hidden_size":  Config.hidden_size,
             "num_layers":   Config.num_layers,
@@ -72,7 +73,6 @@ def train():
             "epochs":       Config.epochs,
             "lr":           Config.lr,
             "device":       str(Config.device),
-            "use_delta":    Config.use_delta,
             "use_rotation": Config.use_rotation,
             "patience":     Config.patience,
             "use_hit_loss": Config.use_hit_loss,
@@ -96,7 +96,7 @@ def train():
     # 데이터 로더 생성 (검증셋은 augmentation 없이)
     train_dataset = MosquitoDataset(train_files, train_labels, is_train=True,
                                     augment_fns=augment_fns,
-                                    use_delta=Config.use_delta,
+                                    input_mode=Config.input_mode,
                                     use_rotation=Config.use_rotation,
                                     subseq_aug=True,
                                     subseq_min_len=Config.subseq_min_len,
@@ -106,7 +106,7 @@ def train():
                                     geo_rotations=Config.geo_rotations,
                                     geo_flips=Config.geo_flips)
     val_dataset   = MosquitoDataset(val_files, train_labels, is_train=True,
-                                    use_delta=Config.use_delta,
+                                    input_mode=Config.input_mode,
                                     use_rotation=Config.use_rotation,
                                     subseq_aug=False,
                                     model_mode=Config.model_mode)
