@@ -25,29 +25,25 @@ class Config:
     test_dir = data_dir / 'test'
     train_labels_path = data_dir / 'train_labels.csv'
     sample_sub_path = data_dir / 'sample_submission.csv'
-    output_dir = Path('./model')  # 모델 & 결과 모두 여기에 저장
+    output_dir = Path('./result')  # 모델 & 결과 모두 여기에 저장
 
     # 모델 하이퍼파라미터
-    input_size = 3    # x, y, z  (delta 모드에서도 feature dim은 동일)
-    output_size = 3   # 예측할 x, y, z
+    input_size = 3 
+    output_size = 3   
 
     hidden_size = 64
     num_layers = 3
-    dropout_rate = 0.1
+    dropout_rate = 0.2
 
     # 학습 설정
-    batch_size = 128
-    epochs = 600
+    batch_size = 64
+    epochs = 300
 
     lr = 1e-3
-    min_lr = 1e-6          # LR 하한선 설정
-    scheduler_factor = 0.5 # 감쇠 폭 완화 (0.1 -> 0.5)
-    patience = 30          
-    warmup_epochs = 10     # 초기 Warm-up 에폭 수
-
-    # WingLoss 하이퍼파라미터
-    wing_w = 0.03
-    wing_e = 0.005
+    min_lr = 1e-6          
+    scheduler_factor = 0.5
+    patience = 10          
+    warmup_epochs = 10     
 
     seed = 42
     run_name = "GRU"  # wandb 실행 이름
@@ -60,6 +56,19 @@ class Config:
     # 'm2o': +80ms 단일 예측 (output 3D)
     # 'm2m': +40ms, +80ms 동시 예측 (output 6D, 제출엔 뒤 3D만 사용)
     model_mode = 'm2o'
+
+    # WingLoss 관련 하이퍼파라미터
+    wing_w = 0.02                 # WingLoss w 파라미터 (원래 0.03)
+    wing_epsilon = 0.005          # WingLoss epsilon 파라미터
+
+    # Hit Loss (3D Gaussian) 관련 하이퍼파라미터
+    use_hit_loss = True           # CombinedLoss 사용 여부 (False면 기존 WingLoss만)
+    sigma_beam = 0.005            # 레이저 빔 유효 표준편차 (m), 대회 기준 0.01m 기반
+    sigma_mosquito = 0.002        # 모기 유효 크기 표준편차 (m)
+    transition_start = 50 / 300   # Curriculum 전환 시작 비율 (50 epoch까지 1단계)
+    transition_end = 150 / 300    # Curriculum 전환 완료 비율 (150 epoch까지 2단계)
+    alpha_min = 0.3               # WingLoss 최소 가중치 (전환 후)
+    beta_min = 0.05               # HitLoss 초기 가중치 (전환 전)
 
 
 def parse_args():
@@ -92,15 +101,22 @@ def parse_args():
                         help="Model output mode: 'm2o' (+80ms 단일 예측, default) or "
                              "'m2m' (+40ms, +80ms 동시 예측 — 제출엔 +80ms head만 사용)")
 
-    parser.add_argument('--wing-w', type=float, default=0.03,
-                        help="WingLoss w 파라미터 (flat 구간 너비, default: 0.03)")
-    parser.add_argument('--wing-e', type=float, default=0.005,
-                        help="WingLoss epsilon 파라미터 (곡률 조절, default: 0.005)")
-
     parser.add_argument('--model_path', type=str, default=None,
                         help="Specific model path for inference")
 
-    parser.set_defaults(rotate=True)
+    # WingLoss 관련 인자
+    parser.add_argument('--wing-w', type=float, default=None,
+                        help="Override wing_w for WingLoss (default: 0.02)")
+
+    # Hit Loss 관련 인자
+    parser.add_argument('--no-hit-loss', dest='use_hit_loss', action='store_false',
+                        help="Disable Hit Loss (use WingLoss only). Default: Hit Loss ON")
+    parser.add_argument('--sigma-beam', type=float, default=None,
+                        help="Override sigma_beam for GaussianHitLoss (default: 0.005)")
+    parser.add_argument('--sigma-mosquito', type=float, default=None,
+                        help="Override sigma_mosquito for GaussianHitLoss (default: 0.002)")
+
+    parser.set_defaults(rotate=True, use_hit_loss=True)
 
     return parser.parse_args()
 
@@ -114,8 +130,17 @@ def apply_args(args):
     Config.subseq_min_len = args.subseq_min
     Config.subseq_max_len = args.subseq_max
     Config.model_mode   = args.model_mode
-    Config.wing_w       = args.wing_w
-    Config.wing_e       = args.wing_e
+
+    # WingLoss 설정 반영
+    if hasattr(args, 'wing_w') and args.wing_w is not None:
+        Config.wing_w = args.wing_w
+
+    # Hit Loss 설정 반영
+    Config.use_hit_loss = args.use_hit_loss
+    if args.sigma_beam is not None:
+        Config.sigma_beam = args.sigma_beam
+    if args.sigma_mosquito is not None:
+        Config.sigma_mosquito = args.sigma_mosquito
 
     # 디바이스 설정
     if args.device == 'auto':

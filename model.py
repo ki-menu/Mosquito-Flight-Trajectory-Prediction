@@ -69,6 +69,145 @@ class WingLoss(nn.Module):
         )
         return loss.mean()
 
+
+class GaussianHitLoss(nn.Module):
+    """3D Gaussian-based Hit Loss for laser-mosquito engagement.
+
+    두 등방(Isotropic) 3D 가우시안 분포의 overlap ratio를 closed-form으로 계산.
+    - G_beam: 예측 좌표(μ_pred)를 중심으로 한 레이저 빔의 에너지 분포
+    - M_vol:  정답 좌표(μ_true)를 중심으로 한 모기의 3D 부피
+
+    Loss = 1 - overlap_ratio
+
+    overlap = (σ_b² / (σ_b² + σ_m²))^(3/2) · exp(-||μ_pred - μ_true||² / (2(σ_b² + σ_m²)))
+
+    Args:
+        sigma_beam: 레이저 빔(타격 판정)의 유효 표준편차 (m).
+                    대회 정답 인정 거리 0.01m 기준으로 설정.
+        sigma_mosquito: 모기 유효 크기의 표준편차 (m).
+    """
+    def __init__(self, sigma_beam=0.005, sigma_mosquito=0.002):
+        super().__init__()
+        self.sigma_beam = sigma_beam
+        self.sigma_mosquito = sigma_mosquito
+
+        # 사전 계산 가능한 상수
+        sigma_sum_sq = sigma_beam ** 2 + sigma_mosquito ** 2
+        self.register_buffer(
+            '_inv_2sigma_sum_sq',
+            torch.tensor(1.0 / (2.0 * sigma_sum_sq))
+        )
+        self.register_buffer(
+            '_scale',
+            torch.tensor((sigma_beam ** 2 / sigma_sum_sq) ** 1.5)
+        )
+
+    def forward(self, pred, target):
+        """
+        Args:
+            pred:   (B, 3) 모델 예측 좌표 (변환된 좌표계).
+            target: (B, 3) 정답 좌표 (변환된 좌표계).
+
+        Returns:
+            스칼라 손실값.
+        """
+        diff = pred - target                                    # (B, 3)
+        dist_sq = (diff ** 2).sum(dim=-1)                       # (B,)
+
+        overlap = self._scale * torch.exp(-dist_sq * self._inv_2sigma_sum_sq)  # (B,)
+
+        return (1.0 - overlap).mean()
+
+
+class CombinedLoss(nn.Module):
+    """WingLoss + GaussianHitLoss를 Curriculum Learning 전략으로 결합.
+
+    학습 진행률(progress = epoch / total_epochs)에 따라 가중치를 동적 조절:
+      - 초반 (progress < transition_start):
+          alpha = 1.0,   beta = beta_min  → WingLoss 위주로 빠르게 수렴
+      - 전환 구간 (transition_start ~ transition_end):
+          alpha: 1.0 → alpha_min,  beta: beta_min → 1.0  (선형 보간)
+      - 후반 (progress > transition_end):
+          alpha = alpha_min,  beta = 1.0  → HitLoss 위주로 명중률 극대화
+
+    Total Loss = alpha · WingLoss + beta · HitLoss
+
+    Args:
+        wing_w, wing_epsilon: WingLoss 파라미터.
+        sigma_beam, sigma_mosquito: GaussianHitLoss 파라미터.
+        transition_start: curriculum 전환 시작 비율 (0~1).
+        transition_end: curriculum 전환 완료 비율 (0~1).
+        alpha_min: 전환 완료 후 WingLoss 최소 가중치.
+        beta_min: 학습 초기 HitLoss 최소 가중치.
+    """
+    def __init__(self, wing_w=0.03, wing_epsilon=0.005,
+                 sigma_beam=0.008, sigma_mosquito=0.003,
+                 transition_start=0.3, transition_end=0.7,
+                 alpha_min=0.3, beta_min=0.05):
+        super().__init__()
+        self.wing_loss = WingLoss(w=wing_w, epsilon=wing_epsilon)
+        self.hit_loss = GaussianHitLoss(sigma_beam=sigma_beam,
+                                         sigma_mosquito=sigma_mosquito)
+
+        self.transition_start = transition_start
+        self.transition_end = transition_end
+        self.alpha_min = alpha_min
+        self.beta_min = beta_min
+
+        # 현재 가중치 (set_progress로 갱신)
+        self._alpha = 1.0
+        self._beta = beta_min
+
+    def set_progress(self, progress):
+        """학습 진행률(0~1)에 따른 가중치 갱신.
+
+        Args:
+            progress: epoch / total_epochs (0.0 ~ 1.0).
+        """
+        if progress < self.transition_start:
+            self._alpha = 1.0
+            self._beta = self.beta_min
+        elif progress > self.transition_end:
+            self._alpha = self.alpha_min
+            self._beta = 1.0
+        else:
+            # 선형 보간
+            t = (progress - self.transition_start) / (self.transition_end - self.transition_start)
+            self._alpha = 1.0 + t * (self.alpha_min - 1.0)
+            self._beta = self.beta_min + t * (1.0 - self.beta_min)
+
+    @property
+    def alpha(self):
+        return self._alpha
+
+    @property
+    def beta(self):
+        return self._beta
+
+    def forward(self, pred, target):
+        """
+        Args:
+            pred:   (B, 3) 모델 예측.
+            target: (B, 3) 정답.
+
+        Returns:
+            total_loss: 스칼라 손실.
+            loss_dict:  개별 항 값 (로깅용).
+        """
+        l_wing = self.wing_loss(pred, target)
+        l_hit = self.hit_loss(pred, target)
+
+        total = self._alpha * l_wing + self._beta * l_hit
+
+        loss_dict = {
+            'wing_loss': l_wing.item(),
+            'hit_loss': l_hit.item(),
+            'alpha': self._alpha,
+            'beta': self._beta,
+        }
+        return total, loss_dict
+
+
 class PhysicsInformedLoss(nn.Module):
     """WingLoss + 물리학적 역학 제약 기반 정규화 항을 결합한 복합 손실 함수.
 

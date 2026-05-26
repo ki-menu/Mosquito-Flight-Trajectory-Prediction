@@ -12,3 +12,6 @@ wandb/
 
 #vs
 .vscode/
+
+# Antigravity agent log
+antigravity.md
