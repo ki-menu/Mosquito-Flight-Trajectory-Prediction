@@ -12,7 +12,7 @@ import os
 
 from args import Config, set_seed, parse_args, apply_args
 from model import MosquitoGRU, MosquitoGRU_M2M, WingLoss, CombinedLoss
-from dataset import MosquitoDataset
+from dataset import MosquitoDataset, filter_outliers
 
 
 def compute_step(outputs, targets, criterion, model_mode):
@@ -84,7 +84,11 @@ def train():
     # 파일 및 라벨 불러오기
     train_files = sorted(list(Config.train_dir.glob('TRAIN_*.csv')))
     train_labels = pd.read_csv(Config.train_labels_path)
-    
+
+    # Outlier 제거 (검증셋 분리 전에 적용)
+    if Config.outlier_threshold is not None:
+        train_files, _ = filter_outliers(train_files, train_labels, Config.outlier_threshold)
+
     # 검증셋 분리 (8:2)
     train_files, val_files = train_test_split(train_files, test_size=0.2, random_state=Config.seed)
     

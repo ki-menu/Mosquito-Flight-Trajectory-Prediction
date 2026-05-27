@@ -62,6 +62,9 @@ class Config:
     geo_rotations = (0, 90, 180, 270)     # --geo-rot: Z축 회전 각도 목록
     geo_flips     = ('none', 'y', 'x')    # --geo-flip: 반사 목록
 
+    # Outlier 필터링
+    outlier_threshold = None               # --outlier-threshold: None이면 제거 안 함
+
     # WingLoss 관련 하이퍼파라미터
     wing_w = 0.02                 # WingLoss w 파라미터 (원래 0.03)
     wing_epsilon = 0.005          # WingLoss epsilon 파라미터
@@ -134,6 +137,11 @@ def parse_args():
     parser.add_argument('--beta', type=float, default=None,
                         help="GaussianHitLoss 고정 가중치 β (default: 0.005). Curriculum 비활성화됨")
 
+    parser.add_argument('--outlier-threshold', type=float, default=None,
+                        metavar='M',
+                        help="선형 외삽 오차 임계값 (m). 이 값 초과 샘플을 학습에서 제거. "
+                             "None이면 제거 안 함 (default: None)")
+
     parser.set_defaults(rotate=True, use_hit_loss=True)
 
     return parser.parse_args()
@@ -166,6 +174,8 @@ def apply_args(args):
         Config.alpha_min = args.alpha
     if args.beta is not None:
         Config.beta_min = args.beta
+
+    Config.outlier_threshold = args.outlier_threshold
 
     # 디바이스 설정
     if args.device == 'auto':

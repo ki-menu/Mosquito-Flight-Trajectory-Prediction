@@ -4,6 +4,7 @@ Handles data loading, caching, augmentation application, and normalization.
 """
 import os
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
@@ -13,6 +14,54 @@ from concurrent.futures import ThreadPoolExecutor
 from augmentation import generate_subsequences, apply_geometric_augmentations
 from transformation import apply_transformations
 
+
+# ── Outlier Filtering ─────────────────────────────────────────────────────────
+
+def _extrapolate_80ms(seq: np.ndarray) -> np.ndarray:
+    """Linear extrapolation from last 2 points: +80ms = 0ms + 2 * velocity."""
+    velocity = seq[-1] - seq[-2]
+    return seq[-1] + 2 * velocity
+
+
+def filter_outliers(file_paths: list, labels_df: pd.DataFrame,
+                    threshold: float) -> tuple:
+    """Remove samples whose linear-extrapolation error > threshold.
+
+    Args:
+        file_paths: list of Path objects to train CSV files
+        labels_df:  DataFrame with columns ['id', 'x', 'y', 'z']
+        threshold:  max allowed extrapolation error in metres
+
+    Returns:
+        filtered_paths: list[Path]  — inlier files
+        outlier_ids:    list[str]   — stem names of removed files
+    """
+    labels_dict = labels_df.set_index('id')[['x', 'y', 'z']].T.to_dict('list')
+
+    outlier_set = set()
+    for path in tqdm(file_paths, desc=f"Filtering outliers (threshold={threshold}m)"):
+        fid = path.stem
+        if fid not in labels_dict:
+            continue
+        seq = np.loadtxt(str(path), delimiter=',', skiprows=1,
+                         usecols=(1, 2, 3), dtype=np.float32)
+        target = np.array(labels_dict[fid], dtype=np.float32)
+        dist = float(np.linalg.norm(_extrapolate_80ms(seq) - target))
+        if dist > threshold:
+            outlier_set.add(fid)
+
+    filtered_paths = [p for p in file_paths if p.stem not in outlier_set]
+    outlier_ids = sorted(outlier_set)
+
+    n_total = len(file_paths)
+    n_removed = len(outlier_ids)
+    print(f"Outlier filter: removed {n_removed}/{n_total} "
+          f"({n_removed/n_total*100:.1f}%) → {len(filtered_paths)} samples remain")
+
+    return filtered_paths, outlier_ids
+
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
 
 class MosquitoDataset(Dataset):
     _cache_dir = Path('./data/.cache')
