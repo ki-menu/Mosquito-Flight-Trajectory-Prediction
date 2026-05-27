@@ -67,7 +67,7 @@ class MosquitoDataset(Dataset):
     _cache_dir = Path('./data/.cache')
 
     def __init__(self, file_paths, labels_df=None, is_train=True, augment_fns=None,
-                 use_delta=False, use_rotation=True, subseq_aug=False,
+                 input_mode='raw', use_rotation=True, subseq_aug=False,
                  subseq_min_len=2, subseq_max_len=11, model_mode='m2o',
                  geo_aug=False, geo_rotations=(0, 90, 180, 270), geo_flips=('none', 'y', 'x')):
         self.is_train = is_train
@@ -148,9 +148,9 @@ class MosquitoDataset(Dataset):
         else:
             target_array = None
 
-        # ── 3. Transformation (회전 정규화 + 원점 이동 + Delta) ───────────
+        # ── 3. Transformation (회전 정규화 + 원점 이동 + 특징 추출) ──────
         sequences_norm, transformed_targets, last_positions, rot_mats = apply_transformations(
-            raw, target_array, use_rotation=use_rotation, use_delta=use_delta,
+            raw, target_array, use_rotation=use_rotation, input_mode=input_mode,
             model_mode=model_mode,
         )
 

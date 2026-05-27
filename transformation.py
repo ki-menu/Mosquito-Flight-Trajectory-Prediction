@@ -48,20 +48,24 @@ def get_rotation_matrix(coords: np.ndarray) -> np.ndarray:
 
 
 def apply_transformations(sequences: np.ndarray, targets: np.ndarray = None,
-                         use_rotation: bool = True, use_delta: bool = False,
+                         use_rotation: bool = True, input_mode: str = 'raw',
                          model_mode: str = 'm2o'):
     """
-    Apply rotation, translation (origin shift), and optionally delta conversion.
+    Apply rotation, translation (origin shift), and feature extraction.
 
     Args:
         sequences: (N, T, 3) array of trajectory coordinates.
         targets: (N, 3) for m2o, or (N, 6) for m2m ([t40, t80], NaN where t40 unknown).
         use_rotation: Whether to rotate sequences to align with x-axis.
-        use_delta: Whether to convert positions to displacement vectors (deltas).
+        input_mode: Feature mode for model input.
+            'raw'     → (N, T, 3)  position only
+            'delta'   → (N, T-1, 3) displacement vectors
+            'vel'     → (N, T, 6)  position + velocity (zero-padded)
+            'vel+acc' → (N, T, 9)  position + velocity + acceleration (zero-padded)
         model_mode: 'm2o' or 'm2m'.
 
     Returns:
-        transformed_sequences: (N, T', 3)
+        transformed_sequences: (N, T', C) where C depends on input_mode
         transformed_targets: (N, 3) for m2o, (N, 6) for m2m, or None
         last_positions: (N, 3) original last positions before normalization
         rot_mats: (N, 3, 3) rotation matrices used
@@ -80,9 +84,26 @@ def apply_transformations(sequences: np.ndarray, targets: np.ndarray = None,
     last_positions_rot = sequences_rot[:, -1, :]
     sequences_norm = sequences_rot - last_positions_rot[:, np.newaxis, :]
 
-    # 3. Delta conversion
-    if use_delta:
+    # 3. Feature extraction based on input_mode
+    if input_mode == 'delta':
         sequences_norm = np.diff(sequences_norm, axis=1)
+    elif input_mode in ('vel', 'vel+acc'):
+        # velocity: (N, T-1, 3) → zero-pad front → (N, T, 3)
+        vel = np.diff(sequences_norm, axis=1).astype(np.float32)
+        vel_pad = np.concatenate(
+            [np.zeros((N, 1, 3), dtype=np.float32), vel], axis=1
+        )
+        if input_mode == 'vel':
+            sequences_norm = np.concatenate([sequences_norm, vel_pad], axis=-1)
+        else:  # vel+acc
+            # acceleration: (N, T-2, 3) → zero-pad 2 front → (N, T, 3)
+            acc = np.diff(vel, axis=1).astype(np.float32)
+            acc_pad = np.concatenate(
+                [np.zeros((N, 2, 3), dtype=np.float32), acc], axis=1
+            )
+            sequences_norm = np.concatenate(
+                [sequences_norm, vel_pad, acc_pad], axis=-1
+            )
 
     # 4. Transform targets
     transformed_targets = None

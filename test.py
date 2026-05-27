@@ -13,7 +13,50 @@ from dataset import MosquitoDataset
 
 def inference(model_path=None):
     """추론을 수행하고 submission CSV를 result/ 디렉토리에 저장한다."""
-    # 모델 초기화 (학습 시와 동일한 --model-mode, --input, --no-rotate 인수 필요)
+    # ── 1. 모델 경로 결정 ─────────────────────────────────────────────
+    if model_path is None:
+        save_files = list(Config.output_dir.glob('gru_*_*.pth'))
+        if not save_files:
+            raise FileNotFoundError("학습된 모델 파일을 찾을 수 없습니다. (result/gru_*.pth)")
+
+        def get_dist(path):
+            try:
+                return float(path.stem.split('_')[1])
+            except Exception:
+                return float('inf')
+
+        model_path = sorted(save_files, key=get_dist)[0]
+
+    print(f"Loading model from: {model_path}")
+
+    # ── 2. Checkpoint 로드 → Config 자동 복원 ────────────────────────
+    ckpt = torch.load(model_path, map_location='cpu')
+
+    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+        # 새 포맷: 메타데이터 포함
+        state_dict    = ckpt['model_state_dict']
+        Config.input_mode   = ckpt.get('input_mode',   Config.input_mode)
+        Config.input_size   = ckpt.get('input_size',   Config.input_size)
+        Config.model_mode   = ckpt.get('model_mode',   Config.model_mode)
+        Config.use_rotation = ckpt.get('use_rotation', Config.use_rotation)
+        Config.hidden_size  = ckpt.get('hidden_size',  Config.hidden_size)
+        Config.num_layers   = ckpt.get('num_layers',   Config.num_layers)
+        print(f"  input_mode={Config.input_mode}, model_mode={Config.model_mode}, "
+              f"use_rotation={Config.use_rotation}")
+    else:
+        # 구 포맷: state_dict만 있음 — weight 모양으로 input_size 자동 감지
+        state_dict = ckpt
+        w = state_dict.get('gru.weight_ih_l0')
+        if w is not None and w.shape[1] != Config.input_size:
+            Config.input_size = w.shape[1]
+            if Config.input_size == 6:
+                Config.input_mode = 'vel'
+            elif Config.input_size == 9:
+                Config.input_mode = 'vel+acc'
+            print(f"  Auto-detected input_size={Config.input_size}, "
+                  f"input_mode='{Config.input_mode}'")
+
+    # ── 3. 모델 초기화 ────────────────────────────────────────────────
     if Config.model_mode == 'm2m':
         model = MosquitoGRU_M2M(
             input_size=Config.input_size,
@@ -29,31 +72,14 @@ def inference(model_path=None):
             output_size=Config.output_size,
             dropout_rate=Config.dropout_rate,
         ).to(Config.device)
-    
-    # 모델 경로 결정
-    if model_path is None:
-        # model 폴더에서 가장 성능이 좋은(Dist가 낮은) 파일 검색
-        save_files = list(Config.output_dir.glob('gru_*_*.pth'))
-        if not save_files:
-            raise FileNotFoundError("학습된 모델 파일을 찾을 수 없습니다. (result/gru_*.pth)")
-        
-        # 파일명 형식: gru_{dist}_{epoch}.pth -> dist(두 번째 요소)가 가장 작은 것 선택
-        def get_dist(path):
-            try:
-                return float(path.stem.split('_')[1])
-            except:
-                return float('inf')
-        
-        model_path = sorted(save_files, key=get_dist)[0]
-        
-    print(f"Loading model from: {model_path}")
-    model.load_state_dict(torch.load(model_path))
+
+    model.load_state_dict(state_dict)
     model.eval()
     
     # Test 데이터셋 로드
     test_files = sorted(list(Config.test_dir.glob('TEST_*.csv')))
     test_dataset = MosquitoDataset(test_files, is_train=False,
-                                   use_delta=Config.use_delta,
+                                   input_mode=Config.input_mode,
                                    use_rotation=Config.use_rotation)
     test_loader = DataLoader(test_dataset, batch_size=Config.batch_size, shuffle=False)
     
