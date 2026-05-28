@@ -85,12 +85,12 @@ def train():
     train_files = sorted(list(Config.train_dir.glob('TRAIN_*.csv')))
     train_labels = pd.read_csv(Config.train_labels_path)
 
-    # Outlier 제거 (검증셋 분리 전에 적용)
+    # 검증셋 분리 (8:2) — 전체에서 먼저 분리
+    train_files, val_files = train_test_split(train_files, test_size=0.2, random_state=Config.seed)
+
+    # Outlier 제거 — train에만 적용 (val은 test와 동일한 조건 유지)
     if Config.outlier_threshold is not None:
         train_files, _ = filter_outliers(train_files, train_labels, Config.outlier_threshold)
-
-    # 검증셋 분리 (8:2)
-    train_files, val_files = train_test_split(train_files, test_size=0.2, random_state=Config.seed)
     
     # 학습에 적용할 augmentation 함수 목록 (원하는 함수를 추가/제거)
     augment_fns = [
