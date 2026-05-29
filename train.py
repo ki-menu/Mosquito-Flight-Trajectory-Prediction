@@ -85,38 +85,55 @@ def train():
     train_files = sorted(list(Config.train_dir.glob('TRAIN_*.csv')))
     train_labels = pd.read_csv(Config.train_labels_path)
 
-    # 검증셋 분리 (8:2) — 전체에서 먼저 분리
-    train_files, val_files = train_test_split(train_files, test_size=0.2, random_state=Config.seed)
-
-    # Outlier 제거 — train에만 적용 (val은 test와 동일한 조건 유지)
-    if Config.outlier_threshold is not None:
-        train_files, _ = filter_outliers(train_files, train_labels, Config.outlier_threshold)
-    
     # 학습에 적용할 augmentation 함수 목록 (원하는 함수를 추가/제거)
     augment_fns = [
         # translate_last_to_origin,
     ]
 
-    # 데이터 로더 생성 (검증셋은 augmentation 없이)
-    train_dataset = MosquitoDataset(train_files, train_labels, is_train=True,
-                                    augment_fns=augment_fns,
-                                    input_mode=Config.input_mode,
-                                    use_rotation=Config.use_rotation,
-                                    subseq_aug=True,
-                                    subseq_min_len=Config.subseq_min_len,
-                                    subseq_max_len=Config.subseq_max_len,
-                                    model_mode=Config.model_mode,
-                                    geo_aug=Config.geo_aug,
-                                    geo_rotations=Config.geo_rotations,
-                                    geo_flips=Config.geo_flips)
-    val_dataset   = MosquitoDataset(val_files, train_labels, is_train=True,
-                                    input_mode=Config.input_mode,
-                                    use_rotation=Config.use_rotation,
-                                    subseq_aug=False,
-                                    model_mode=Config.model_mode)
-    
-    train_loader = DataLoader(train_dataset, batch_size=Config.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=Config.batch_size, shuffle=False)
+    if Config.full_train:
+        # ── Full-train 모드: val 없이 전체 데이터 학습 ───────────────
+        print("=== Full-train mode: using ALL train data (no validation) ===")
+        if Config.outlier_threshold is not None:
+            train_files, _ = filter_outliers(train_files, train_labels, Config.outlier_threshold)
+
+        train_dataset = MosquitoDataset(train_files, train_labels, is_train=True,
+                                        augment_fns=augment_fns,
+                                        input_mode=Config.input_mode,
+                                        use_rotation=Config.use_rotation,
+                                        subseq_aug=True,
+                                        subseq_min_len=Config.subseq_min_len,
+                                        subseq_max_len=Config.subseq_max_len,
+                                        model_mode=Config.model_mode,
+                                        geo_aug=Config.geo_aug,
+                                        geo_rotations=Config.geo_rotations,
+                                        geo_flips=Config.geo_flips)
+        train_loader = DataLoader(train_dataset, batch_size=Config.batch_size, shuffle=True)
+        val_loader = None
+    else:
+        # ── 일반 모드: 8:2 분리 ───────────────────────────────────────
+        train_files, val_files = train_test_split(train_files, test_size=0.2, random_state=Config.seed)
+
+        if Config.outlier_threshold is not None:
+            train_files, _ = filter_outliers(train_files, train_labels, Config.outlier_threshold)
+
+        train_dataset = MosquitoDataset(train_files, train_labels, is_train=True,
+                                        augment_fns=augment_fns,
+                                        input_mode=Config.input_mode,
+                                        use_rotation=Config.use_rotation,
+                                        subseq_aug=True,
+                                        subseq_min_len=Config.subseq_min_len,
+                                        subseq_max_len=Config.subseq_max_len,
+                                        model_mode=Config.model_mode,
+                                        geo_aug=Config.geo_aug,
+                                        geo_rotations=Config.geo_rotations,
+                                        geo_flips=Config.geo_flips)
+        val_dataset   = MosquitoDataset(val_files, train_labels, is_train=True,
+                                        input_mode=Config.input_mode,
+                                        use_rotation=Config.use_rotation,
+                                        subseq_aug=False,
+                                        model_mode=Config.model_mode)
+        train_loader = DataLoader(train_dataset, batch_size=Config.batch_size, shuffle=True)
+        val_loader   = DataLoader(val_dataset,   batch_size=Config.batch_size, shuffle=False)
     
     # 모델, 손실함수, 옵티마이저 초기화
     if Config.model_mode == 'm2m':
@@ -135,6 +152,13 @@ def train():
             dropout_rate=Config.dropout_rate,
         ).to(Config.device)
     
+    # Pretrain 가중치 로드 (--model-path 지정 시)
+    if Config.model_path is not None:
+        checkpoint = torch.load(Config.model_path, map_location=Config.device)
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        model.load_state_dict(state_dict)
+        print(f"Loaded pretrained weights: {Config.model_path}")
+
     # 모델 가중치 및 기울기 로그 기록 설정
     wandb.watch(model, log='all', log_freq=100)
     
@@ -210,41 +234,46 @@ def train():
         train_dist /= n_train
         train_acc = train_correct / n_train
 
-        # 검증
-        model.eval()
-        val_loss = 0.0
-        val_dist = 0.0
-        val_correct = 0
-        val_pbar = tqdm(val_loader, desc=f"Epoch [{epoch+1}/{Config.epochs}] Val", leave=False)
-        with torch.no_grad():
-            for seq, target in val_pbar:
-                seq, target = seq.to(Config.device), target.to(Config.device)
-                outputs = model(seq)
-                loss, dists, _ = compute_step(outputs, target, criterion, Config.model_mode)
-                val_loss += loss.item() * seq.size(0)
-                val_dist += dists.sum().item()
-                val_correct += (dists < ACC_THRESHOLD).sum().item()
+        # 검증 (full_train 모드에서는 생략)
+        if val_loader is not None:
+            model.eval()
+            val_loss = 0.0
+            val_dist = 0.0
+            val_correct = 0
+            val_pbar = tqdm(val_loader, desc=f"Epoch [{epoch+1}/{Config.epochs}] Val", leave=False)
+            with torch.no_grad():
+                for seq, target in val_pbar:
+                    seq, target = seq.to(Config.device), target.to(Config.device)
+                    outputs = model(seq)
+                    loss, dists, _ = compute_step(outputs, target, criterion, Config.model_mode)
+                    val_loss += loss.item() * seq.size(0)
+                    val_dist += dists.sum().item()
+                    val_correct += (dists < ACC_THRESHOLD).sum().item()
 
-        n_val = len(val_loader.dataset)
-        val_loss /= n_val
-        val_dist /= n_val
-        val_acc = val_correct / n_val
+            n_val = len(val_loader.dataset)
+            val_loss /= n_val
+            val_dist /= n_val
+            val_acc = val_correct / n_val
 
-        print(f"Epoch [{epoch+1}/{Config.epochs}] "
-              f"Train Loss: {train_loss:.6f}  Val Loss: {val_loss:.6f} | "
-              f"Train Dist: {train_dist:.4f}  Val Dist: {val_dist:.4f} | "
-              f"Train Acc: {train_acc:.4f}  Val Acc: {val_acc:.4f}")
+            print(f"Epoch [{epoch+1}/{Config.epochs}] "
+                  f"Train Loss: {train_loss:.6f}  Val Loss: {val_loss:.6f} | "
+                  f"Train Dist: {train_dist:.4f}  Val Dist: {val_dist:.4f} | "
+                  f"Train Acc: {train_acc:.4f}  Val Acc: {val_acc:.4f}")
+        else:
+            val_loss = val_dist = val_acc = None
+            print(f"Epoch [{epoch+1}/{Config.epochs}] "
+                  f"Train Loss: {train_loss:.6f} | "
+                  f"Train Dist: {train_dist:.4f}  Train Acc: {train_acc:.4f}")
 
         log_dict = {
             "epoch":         epoch + 1,
             "train/loss":    train_loss,
             "train/dist":    train_dist,
             "train/acc":     train_acc,
-            "val/loss":      val_loss,
-            "val/dist":      val_dist,
-            "val/acc":       val_acc,
             "learning_rate": optimizer.param_groups[0]['lr'],
         }
+        if val_loss is not None:
+            log_dict.update({"val/loss": val_loss, "val/dist": val_dist, "val/acc": val_acc})
 
         # CombinedLoss일 경우 curriculum 가중치 및 개별 loss 로깅
         if isinstance(criterion, CombinedLoss):
@@ -252,7 +281,6 @@ def train():
                 "curriculum/alpha": criterion.alpha,
                 "curriculum/beta":  criterion.beta,
             })
-            # 마지막 배치의 loss_dict를 로깅 (대표값)
             if loss_dict is not None:
                 log_dict.update({
                     "train/wing_loss": loss_dict.get('wing_loss', 0),
@@ -261,17 +289,19 @@ def train():
 
         wandb.log(log_dict)
 
-        # 스케줄러 업데이트 (Warm-up 이후에만 작동하도록 설정 가능)
+        # 스케줄러 업데이트 (full_train이면 train_loss 기준)
+        monitor_loss = val_loss if val_loader is not None else train_loss
         if epoch >= Config.warmup_epochs:
-            scheduler.step(val_loss)
+            scheduler.step(monitor_loss)
 
-        # 성능이 개선되면 모델 저장 (임시 저장)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_val_dist_total = val_dist
+        # 모델 저장 (val_loss 우선, full_train이면 train_loss 기준)
+        track_loss = val_loss if val_loader is not None else train_loss
+        track_dist = val_dist if val_loader is not None else train_dist
+        if track_loss < best_val_loss:
+            best_val_loss = track_loss
+            best_val_dist_total = track_dist
             best_epoch = epoch + 1
-            
-            # 중간에 꺼질 수 있으므로 임시 파일로 계속 갱신
+
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'input_mode':   Config.input_mode,
@@ -281,17 +311,18 @@ def train():
                 'hidden_size':  Config.hidden_size,
                 'num_layers':   Config.num_layers,
             }, Config.output_dir / 'best_model_tmp.pth')
-            
-            print(f"  --> Updated best model (Epoch {best_epoch}, Loss: {best_val_loss:.6f})")
-            wandb.summary["best_val_loss"] = best_val_loss
-            wandb.summary["best_val_dist"] = best_val_dist_total
-            wandb.summary["best_val_acc"]  = val_acc
-            wandb.summary["best_epoch"]    = best_epoch
-            wandb.summary["patience"]      = Config.patience
 
-    # 학습 종료 후 최종 파일명으로 변경 (Dist값과 에폭 포함)
+            print(f"  --> Updated best model (Epoch {best_epoch}, Loss: {best_val_loss:.6f})")
+            wandb.summary["best_loss"]  = best_val_loss
+            wandb.summary["best_dist"]  = best_val_dist_total
+            wandb.summary["best_epoch"] = best_epoch
+            if val_acc is not None:
+                wandb.summary["best_val_acc"] = val_acc
+
+    # 학습 종료 후 최종 파일명으로 변경
     if best_epoch > 0:
-        final_model_path = Config.output_dir / f'gru_{best_val_dist_total:.4f}_{best_epoch}.pth'
+        prefix = 'gru_fulltrain' if Config.full_train else 'gru'
+        final_model_path = Config.output_dir / f'{prefix}_{best_val_dist_total:.4f}_{best_epoch}.pth'
         os.rename(Config.output_dir / 'best_model_tmp.pth', final_model_path)
         print(f"\nTraining complete. Final best model saved to: {final_model_path}")
 

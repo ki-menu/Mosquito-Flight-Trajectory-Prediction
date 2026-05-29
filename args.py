@@ -68,6 +68,10 @@ class Config:
     # Outlier 필터링
     outlier_threshold = None               # --outlier-threshold: None이면 제거 안 함
 
+    # Full-train 모드
+    full_train = False                     # --full-train: 전체 데이터로 학습 (val 없음)
+    model_path = None                      # --model-path: pretrain 가중치 경로
+
     # WingLoss 관련 하이퍼파라미터
     wing_w = 0.02                 # WingLoss w 파라미터 (원래 0.03)
     wing_epsilon = 0.005          # WingLoss epsilon 파라미터
@@ -124,8 +128,12 @@ def parse_args():
                         choices=['none', 'x', 'y'], metavar='PLANE',
                         help="반사 목록: none/x(yz평면)/y(xz평면) (default: none y x)")
 
-    parser.add_argument('--model_path', type=str, default=None,
-                        help="Specific model path for inference")
+    parser.add_argument('--model-path', type=str, default=None,
+                        help="모델 가중치 경로 (inference 또는 --full-train 초기 가중치)")
+
+    parser.add_argument('--full-train', action='store_true', default=False,
+                        help="전체 train 데이터로 학습 (val 분리 없음). "
+                             "--model-path로 best model 가중치를 지정하는 것을 권장")
 
     # WingLoss 관련 인자
     parser.add_argument('--wing-w', type=float, default=None,
@@ -184,6 +192,8 @@ def apply_args(args):
         Config.beta_min = args.beta
 
     Config.outlier_threshold = args.outlier_threshold
+    Config.full_train  = args.full_train
+    Config.model_path  = args.model_path
 
     # 디바이스 설정
     if args.device == 'auto':
